@@ -1,6 +1,6 @@
-# Dev container for media-extractor (Spring Boot + Maven + Java 21)
+# Dev container for media-extractor (Spring Boot + Maven + Java 25)
 # Based on official VS Code devcontainer images.
-FROM mcr.microsoft.com/vscode/devcontainers/java:0-21
+FROM mcr.microsoft.com/vscode/devcontainers/java:0-25
 
 # Ensure Maven and common tooling are available.
 RUN apt-get update \
