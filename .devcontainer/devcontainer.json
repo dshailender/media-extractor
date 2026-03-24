@@ -9,8 +9,8 @@
     "terminal.integrated.defaultProfile.linux": "bash",
     "java.configuration.runtimes": [
       {
-        "name": "JavaSE-21",
-        "path": "/usr/local/openjdk-21"
+        "name": "JavaSE-25",
+        "path": "/usr/local/openjdk-25"
       }
     ]
   },
