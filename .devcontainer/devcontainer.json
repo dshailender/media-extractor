@@ -1,0 +1,29 @@
+{
+  "name": "media-extractor",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "image": "",
+  "settings": {
+    "terminal.integrated.defaultProfile.linux": "bash",
+    "java.configuration.runtimes": [
+      {
+        "name": "JavaSE-21",
+        "path": "/usr/local/openjdk-21"
+      }
+    ]
+  },
+  "extensions": [
+    "vscjava.vscode-java-pack",
+    "vscjava.vscode-spring-boot",
+    "vscjava.vscode-spring-initializr",
+    "redhat.vscode-yaml",
+    "esbenp.prettier-vscode"
+  ],
+  "postCreateCommand": "./mvnw -B -DskipTests clean package",
+  "forwardPorts": [8080],
+  "remoteUser": "vscode",
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
+}
