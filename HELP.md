@@ -22,16 +22,43 @@ If you manually switch to a different parent and actually want the inheritance, 
 ### Use below command to run the application
 
 ```bash
-java -jar target/media-extractor-1.0.0.jar <sourceDir> <photoTargetDir> <videoTargetDir>
-
+java -jar target/media-extractor-0.0.1-SNAPSHOT.jar [<sourceDir>] [--consolidate]
 ```
 
-### Example
+**Arguments:**
+- `<sourceDir>` (optional): Source directory containing media and archives. Defaults to `C:\Users\Shailender\projects\backup`
+- `--consolidate` (optional): Enable consolidation phase to organize extracted media into flat consolidated directories sorted by date
 
+**Output Directories:**
+
+Without consolidation:
+- `target/photos/` - extracted photos from source
+- `target/videos/` - extracted videos from source
+
+With `--consolidate` flag (additional):
+- `target/consolidated/photos/` - consolidated photos sorted by modification date (ascending)
+- `target/consolidated/videos/` - consolidated videos sorted by modification date (ascending)
+
+The consolidation phase copies all extracted media into flat consolidated directories, maintaining original filenames and processing files in date-ascending order. Filename collisions are handled by appending a numeric suffix.
+
+### Examples
+
+Extract media only (default):
 ```bash
+java -jar target/media-extractor-0.0.1-SNAPSHOT.jar
+```
 
-java -jar target/media-extractor-1.0.0.jar \
-    /backups/my-phone-backup \
-    /organized/photos \
-    /organized/videos
+Extract from custom source directory:
+```bash
+java -jar target/media-extractor-0.0.1-SNAPSHOT.jar C:\Users\Shailender\projects\backup
+```
+
+Extract and consolidate by date:
+```bash
+java -jar target/media-extractor-0.0.1-SNAPSHOT.jar C:\Users\Shailender\projects\backup --consolidate
+```
+
+Consolidate with default source directory:
+```bash
+java -jar target/media-extractor-0.0.1-SNAPSHOT.jar --consolidate
 ```

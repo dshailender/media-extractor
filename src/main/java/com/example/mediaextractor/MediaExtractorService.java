@@ -7,6 +7,7 @@ import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream;
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream;
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
+import org.jspecify.annotations.NonNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -22,6 +23,7 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
 public class MediaExtractorService {
@@ -43,6 +45,7 @@ public class MediaExtractorService {
 
     private Executor executor;
     private Path tempDir;
+    private final AtomicInteger queuedItems = new AtomicInteger();
 
     public void setExecutor(Executor executor) {
         this.executor = executor;
@@ -75,15 +78,19 @@ public class MediaExtractorService {
     }
 
     public void extractMedia(Path sourceDir, Path photoTargetDir, Path videoTargetDir) {
+        queuedItems.set(0);
+        log.info("Starting extraction from {} into photo target {} and video target {}", sourceDir, photoTargetDir, videoTargetDir);
         try {
             Files.walkFileTree(sourceDir, new SimpleFileVisitor<>() {
                 @Override
-                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                public FileVisitResult visitFile(@NonNull Path file, BasicFileAttributes attrs) {
                     Path relativePath = sourceDir.relativize(file);
+                    queuedItems.incrementAndGet();
                     executor.execute(() -> processFile(file, relativePath, photoTargetDir, videoTargetDir));
                     return FileVisitResult.CONTINUE;
                 }
             });
+            log.info("Finished scanning source directory. Queued {} items for processing", queuedItems.get());
         } catch (IOException e) {
             log.error("Error traversing source directory", e);
         }
@@ -111,7 +118,8 @@ public class MediaExtractorService {
     }
 
     private void processArchive(Path archiveFile, Path relativePath, Path photoTargetDir, Path videoTargetDir) {
-        log.info("Processing archive: {}", archiveFile);
+        queuedItems.incrementAndGet();
+        log.info("Processing archive: {} (queued items: {})", archiveFile, queuedItems.get());
         try (InputStream fis = Files.newInputStream(archiveFile);
              ArchiveInputStream ais = createArchiveInputStream(archiveFile, fis)) {
 
