@@ -4,16 +4,20 @@
     "dockerfile": "Dockerfile",
     "context": ".."
   },
-  "settings": {
-    "terminal.integrated.defaultProfile.linux": "bash"
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash"
+      },
+      "extensions": [
+        "vscjava.vscode-java-pack",
+        "vscjava.vscode-spring-boot",
+        "vscjava.vscode-spring-initializr",
+        "redhat.vscode-yaml",
+        "esbenp.prettier-vscode"
+      ]
+    }
   },
-  "extensions": [
-    "vscjava.vscode-java-pack",
-    "vscjava.vscode-spring-boot",
-    "vscjava.vscode-spring-initializr",
-    "redhat.vscode-yaml",
-    "esbenp.prettier-vscode"
-  ],
   "postCreateCommand": "./mvnw -B -DskipTests clean package",
   "forwardPorts": [8080],
   "remoteUser": "vscode",
