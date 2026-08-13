@@ -22,43 +22,57 @@ If you manually switch to a different parent and actually want the inheritance, 
 ### Use below command to run the application
 
 ```bash
-java -jar target/media-extractor-0.0.1-SNAPSHOT.jar [<sourceDir>] [--consolidate]
+java -jar target/media-extractor-0.0.1-SNAPSHOT.jar [<sourceDir>]
 ```
 
 **Arguments:**
 - `<sourceDir>` (optional): Source directory containing media and archives. Defaults to `C:\Users\Shailender\projects\backup`
-- `--consolidate` (optional): Enable consolidation phase to organize extracted media into flat consolidated directories sorted by date
 
-**Output Directories:**
+**Output Directory Structure:**
 
-Without consolidation:
-- `target/photos/` - extracted photos from source
-- `target/videos/` - extracted videos from source
+Media files are extracted and organized by year in the user's home directory:
+```
+~/memories/
+  ├── 2023/
+  │   ├── photos/
+  │   │   ├── photo1.jpg
+  │   │   ├── photo2.png
+  │   │   └── ...
+  │   └── videos/
+  │       ├── video1.mp4
+  │       └── ...
+  ├── 2024/
+  │   ├── photos/
+  │   │   └── ...
+  │   └── videos/
+  │       └── ...
+  └── 2025/
+      ├── photos/
+      └── videos/
+```
 
-With `--consolidate` flag (additional):
-- `target/consolidated/photos/` - consolidated photos sorted by modification date (ascending)
-- `target/consolidated/videos/` - consolidated videos sorted by modification date (ascending)
-
-The consolidation phase copies all extracted media into flat consolidated directories, maintaining original filenames and processing files in date-ascending order. Filename collisions are handled by appending a numeric suffix.
+**Key Features:**
+- Photos extracted to: `~/memories/{YYYY}/photos/`
+- Videos extracted to: `~/memories/{YYYY}/videos/`
+- Year ({YYYY}) is determined by the file's last modified time
+- All files stored in a flat structure (no subdirectories created for source folder hierarchy)
+- Filename collisions handled by appending numeric suffix (e.g., `photo_1.jpg`, `photo_2.jpg`)
+- Supports nested archives: ZIP, TAR, TAR.GZ, TAR.BZ2
+- Single-phase extraction (no separate consolidation step needed)
 
 ### Examples
 
-Extract media only (default):
+Extract media with default source directory:
 ```bash
 java -jar target/media-extractor-0.0.1-SNAPSHOT.jar
 ```
 
 Extract from custom source directory:
 ```bash
-java -jar target/media-extractor-0.0.1-SNAPSHOT.jar C:\Users\Shailender\projects\backup
+java -jar target/media-extractor-0.0.1-SNAPSHOT.jar /home/user/MyPhotos
 ```
 
-Extract and consolidate by date:
+On Windows:
 ```bash
-java -jar target/media-extractor-0.0.1-SNAPSHOT.jar C:\Users\Shailender\projects\backup --consolidate
-```
-
-Consolidate with default source directory:
-```bash
-java -jar target/media-extractor-0.0.1-SNAPSHOT.jar --consolidate
+java -jar target/media-extractor-0.0.1-SNAPSHOT.jar C:\Users\YourName\Pictures
 ```

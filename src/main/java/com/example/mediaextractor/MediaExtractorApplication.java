@@ -23,14 +23,11 @@ public class MediaExtractorApplication implements CommandLineRunner {
     private static final Logger log = LoggerFactory.getLogger(MediaExtractorApplication.class);
 
     private final MediaExtractorService mediaExtractorService;
-    private final MediaConsolidationService consolidationService;
     private final Environment environment;
 
     public MediaExtractorApplication(MediaExtractorService mediaExtractorService,
-                                     MediaConsolidationService consolidationService,
                                      Environment environment) {
         this.mediaExtractorService = mediaExtractorService;
-        this.consolidationService = consolidationService;
         this.environment = environment;
     }
 
@@ -46,34 +43,26 @@ public class MediaExtractorApplication implements CommandLineRunner {
             return;
         }
 
-        boolean consolidate = Arrays.asList(args).contains("--consolidate");
         String sourceArgument = Arrays.stream(args)
-                .filter(arg -> !arg.equals("--consolidate"))
                 .findFirst()
                 .orElse(null);
 
         Path sourceDir = sourceArgument != null
                 ? Path.of(sourceArgument).toAbsolutePath().normalize()
                 : Path.of("C:\\Users\\Shailender\\projects\\backup").toAbsolutePath().normalize();
-        Path projectTargetDir = sourceDir.getParent() != null
-                ? sourceDir.getParent().resolve("target")
-                : Path.of("target");
-        Path photoTargetDir = projectTargetDir.resolve("photos");
-        Path videoTargetDir = projectTargetDir.resolve("videos");
-        Path consolidatedPhotoDir = projectTargetDir.resolve("consolidated").resolve("photos");
-        Path consolidatedVideoDir = projectTargetDir.resolve("consolidated").resolve("videos");
+        
+        Path baseMemoriesDir = Path.of(System.getProperty("user.home")).resolve("memories").toAbsolutePath().normalize();
 
-        log.info("Starting media extraction workflow with sourceDir={}, consolidate={}, photoTargetDir={}, videoTargetDir={}",
-                sourceDir, consolidate, photoTargetDir, videoTargetDir);
+        log.info("Starting media extraction workflow with sourceDir={}, outputBaseDir={}",
+                sourceDir, baseMemoriesDir);
 
         if (!Files.exists(sourceDir)) {
             log.error("Source directory does not exist: {}", sourceDir);
             System.exit(1);
         }
 
-        Files.createDirectories(photoTargetDir);
-        Files.createDirectories(videoTargetDir);
-        log.info("Output directories ready for photos and videos at {} and {}", photoTargetDir, videoTargetDir);
+        Files.createDirectories(baseMemoriesDir);
+        log.info("Base output directory ready at {}", baseMemoriesDir);
 
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             Path tempDir = Files.createTempDirectory("media-extractor");
@@ -81,24 +70,11 @@ public class MediaExtractorApplication implements CommandLineRunner {
 
             mediaExtractorService.setExecutor(executor);
             mediaExtractorService.setTempDir(tempDir);
-            mediaExtractorService.extractMedia(sourceDir, photoTargetDir, videoTargetDir);
+            mediaExtractorService.extractMedia(sourceDir, baseMemoriesDir);
             executor.shutdown();
             log.info("Waiting for extraction tasks to finish");
             if (!executor.awaitTermination(1, TimeUnit.DAYS)) {
                 log.error("Timed out while waiting for extraction tasks to complete");
-            }
-
-            if (consolidate) {
-                log.info("Consolidation flag enabled. Starting consolidation phase");
-                try (ExecutorService consolidationExecutor = Executors.newVirtualThreadPerTaskExecutor()) {
-                    consolidationService.consolidateMedia(photoTargetDir, videoTargetDir,
-                            consolidatedPhotoDir, consolidatedVideoDir, consolidationExecutor);
-                    consolidationExecutor.shutdown();
-                    log.info("Waiting for consolidation tasks to finish");
-                    if (!consolidationExecutor.awaitTermination(1, TimeUnit.DAYS)) {
-                        log.error("Timed out while waiting for consolidation tasks to complete");
-                    }
-                }
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

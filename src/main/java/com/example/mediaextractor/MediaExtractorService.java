@@ -19,8 +19,10 @@ import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -77,16 +79,15 @@ public class MediaExtractorService {
         }
     }
 
-    public void extractMedia(Path sourceDir, Path photoTargetDir, Path videoTargetDir) {
+    public void extractMedia(Path sourceDir, Path baseMemoriesDir) {
         queuedItems.set(0);
-        log.info("Starting extraction from {} into photo target {} and video target {}", sourceDir, photoTargetDir, videoTargetDir);
+        log.info("Starting extraction from {} into memories directory structure at {}", sourceDir, baseMemoriesDir);
         try {
             Files.walkFileTree(sourceDir, new SimpleFileVisitor<>() {
                 @Override
                 public FileVisitResult visitFile(@NonNull Path file, BasicFileAttributes attrs) {
-                    Path relativePath = sourceDir.relativize(file);
                     queuedItems.incrementAndGet();
-                    executor.execute(() -> processFile(file, relativePath, photoTargetDir, videoTargetDir));
+                    executor.execute(() -> processFile(file, baseMemoriesDir));
                     return FileVisitResult.CONTINUE;
                 }
             });
@@ -96,56 +97,87 @@ public class MediaExtractorService {
         }
     }
 
-    private void processFile(Path sourceFile, Path relativePath, Path photoTargetDir, Path videoTargetDir) {
+    private void processFile(Path sourceFile, Path baseMemoriesDir) {
         String fileName = sourceFile.getFileName().toString().toLowerCase();
+        int year = getYearFromFile(sourceFile);
         if (isPhoto(fileName)) {
-            copyMediaFile(sourceFile, photoTargetDir.resolve(relativePath));
+            Path targetDir = baseMemoriesDir.resolve(String.valueOf(year)).resolve("photos");
+            copyMediaFileFlattened(sourceFile, targetDir, sourceFile.getFileName().toString());
         } else if (isVideo(fileName)) {
-            copyMediaFile(sourceFile, videoTargetDir.resolve(relativePath));
+            Path targetDir = baseMemoriesDir.resolve(String.valueOf(year)).resolve("videos");
+            copyMediaFileFlattened(sourceFile, targetDir, sourceFile.getFileName().toString());
         } else if (isArchiveFile(fileName)) {
-            processArchive(sourceFile, relativePath, photoTargetDir, videoTargetDir);
+            processArchive(sourceFile, baseMemoriesDir);
         }
     }
 
-    private void copyMediaFile(Path sourceFile, Path targetFile) {
+    private void copyMediaFileFlattened(Path sourceFile, Path targetDir, String fileName) {
         try {
-            Files.createDirectories(targetFile.getParent());
-            Files.copy(sourceFile, targetFile, StandardCopyOption.REPLACE_EXISTING);
-            log.info("Copied media file to: {}", targetFile);
+            Files.createDirectories(targetDir);
+            Path targetFile = targetDir.resolve(fileName);
+            
+            // Try to copy with collision handling - use retry logic for concurrent safety
+            int maxAttempts = 100;
+            int attempt = 0;
+            
+            while (attempt < maxAttempts) {
+                try {
+                    // Try to copy without overwriting
+                    Files.copy(sourceFile, targetFile);
+                    log.info("Copied media file to: {}", targetFile);
+                    return;
+                } catch (java.nio.file.FileAlreadyExistsException e) {
+                    // File exists, try with a unique name
+                    targetFile = getUniqueFileName(targetDir, fileName);
+                    log.debug("File collision detected, retrying with: {}", targetFile.getFileName());
+                    attempt++;
+                }
+            }
+            
+            log.error("Failed to copy file {} after {} attempts due to persistent collisions", sourceFile, maxAttempts);
         } catch (IOException e) {
             log.error("Error copying media file: {}", sourceFile, e);
         }
     }
 
-    private void processArchive(Path archiveFile, Path relativePath, Path photoTargetDir, Path videoTargetDir) {
+    private void processArchive(Path archiveFile, Path baseMemoriesDir) {
         queuedItems.incrementAndGet();
         log.info("Processing archive: {} (queued items: {})", archiveFile, queuedItems.get());
         try (InputStream fis = Files.newInputStream(archiveFile);
              ArchiveInputStream ais = createArchiveInputStream(archiveFile, fis)) {
 
+            int archiveYear = getYearFromFile(archiveFile);
+            
             ArchiveEntry entry;
             while ((entry = ais.getNextEntry()) != null) {
                 if (entry.isDirectory()) continue;
 
                 String entryName = entry.getName();
-                Path normalizedEntryName = Path.of(entryName).normalize();
-                Path entryRelativePath = relativePath.resolveSibling(
-                        relativePath.getFileName() + "_extracted").resolve(normalizedEntryName);
+                // Extract just the filename, ignoring directory structure within archive
+                Path entryFileName = Path.of(entryName).getFileName();
+                if (entryFileName == null) continue;
+                String fileName = entryFileName.toString();
 
-                if (isPhoto(entryName)) {
-                    Path targetFile = photoTargetDir.resolve(entryRelativePath);
-                    copyArchiveEntry(ais, targetFile);
-                } else if (isVideo(entryName)) {
-                    Path targetFile = videoTargetDir.resolve(entryRelativePath);
-                    copyArchiveEntry(ais, targetFile);
-                } else if (isArchiveFile(entryName)) {
+                // Try to get year from archive entry, fallback to archive year
+                int year = archiveYear;
+                if (entry.getLastModifiedDate() != null) {
+                    year = extractYearFromArchiveEntry(entry);
+                }
+
+                if (isPhoto(fileName)) {
+                    Path targetDir = baseMemoriesDir.resolve(String.valueOf(year)).resolve("photos");
+                    copyArchiveEntryFlattened(ais, targetDir, fileName);
+                } else if (isVideo(fileName)) {
+                    Path targetDir = baseMemoriesDir.resolve(String.valueOf(year)).resolve("videos");
+                    copyArchiveEntryFlattened(ais, targetDir, fileName);
+                } else if (isArchiveFile(fileName)) {
                     Path tempFile = Files.createTempFile(tempDir, "nested-", ".tmp");
                     try (OutputStream tempOut = Files.newOutputStream(tempFile)) {
                         ais.transferTo(tempOut);
                     }
                     executor.execute(() -> {
                         try {
-                            processArchive(tempFile, entryRelativePath, photoTargetDir, videoTargetDir);
+                            processArchive(tempFile, baseMemoriesDir);
                         } finally {
                             try {
                                 Files.delete(tempFile);
@@ -161,15 +193,38 @@ public class MediaExtractorService {
         }
     }
 
-    private void copyArchiveEntry(ArchiveInputStream ais, Path targetFile) throws IOException {
+    private void copyArchiveEntryFlattened(ArchiveInputStream ais, Path targetDir, String fileName) {
         try {
-            Files.createDirectories(targetFile.getParent());
-            try (OutputStream out = Files.newOutputStream(targetFile)) {
-                ais.transferTo(out);
+            Files.createDirectories(targetDir);
+            Path targetFile = targetDir.resolve(fileName);
+            
+            // Copy to temp file first, then move with collision handling
+            int maxAttempts = 100;
+            int attempt = 0;
+            
+            while (attempt < maxAttempts) {
+                try {
+                    // Copy to temp file first
+                    Path tempFile = targetDir.resolve("temp_" + System.nanoTime() + "_" + fileName);
+                    try (OutputStream out = Files.newOutputStream(tempFile)) {
+                        ais.transferTo(out);
+                    }
+                    
+                    // Try to move without overwriting
+                    Files.move(tempFile, targetFile);
+                    log.info("Extracted media file to: {}", targetFile);
+                    return;
+                } catch (java.nio.file.FileAlreadyExistsException e) {
+                    // Target exists, try with a unique name
+                    targetFile = getUniqueFileName(targetDir, fileName);
+                    log.debug("File collision detected during extract, retrying with: {}", targetFile.getFileName());
+                    attempt++;
+                }
             }
-            log.info("Extracted media file to: {}", targetFile);
+            
+            log.error("Failed to extract file {} from archive after {} attempts due to persistent collisions", fileName, maxAttempts);
         } catch (IOException e) {
-            log.error("Error extracting media file to: {}", targetFile, e);
+            log.error("Error extracting media file to: {}", targetDir.resolve(fileName), e);
         }
     }
 
@@ -205,5 +260,63 @@ public class MediaExtractorService {
         if (ARCHIVE_EXTENSIONS.contains(ext)) return true;
         if (fileName.endsWith(".tar.gz") || fileName.endsWith(".tar.bz2")) return true;
         return false;
+    }
+
+    /**
+     * Extracts the year from a file's last modified time.
+     * Falls back to current year if metadata is unavailable.
+     */
+    private int getYearFromFile(Path file) {
+        try {
+            BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
+            Instant instant = Instant.ofEpochMilli(attrs.lastModifiedTime().toMillis());
+            LocalDateTime dateTime = LocalDateTime.ofInstant(instant, ZoneId.systemDefault());
+            return dateTime.getYear();
+        } catch (IOException e) {
+            log.warn("Failed to read file attributes for {}: {}. Using current year as fallback", file, e.getMessage());
+            return LocalDateTime.now().getYear();
+        }
+    }
+
+    /**
+     * Extracts the year from an archive entry's last modified date.
+     * Falls back to current year if date is unavailable.
+     */
+    private int extractYearFromArchiveEntry(ArchiveEntry entry) {
+        try {
+            if (entry.getLastModifiedDate() != null) {
+                Instant instant = entry.getLastModifiedDate().toInstant();
+                LocalDateTime dateTime = LocalDateTime.ofInstant(instant, ZoneId.systemDefault());
+                return dateTime.getYear();
+            }
+        } catch (Exception e) {
+            log.debug("Failed to extract year from archive entry: {}", e.getMessage());
+        }
+        return LocalDateTime.now().getYear();
+    }
+
+    /**
+     * Generates a unique filename by appending a numeric suffix if the target file already exists.
+     * For example: "photo.jpg" becomes "photo_1.jpg", "photo_2.jpg", etc.
+     */
+    private Path getUniqueFileName(Path targetDir, String fileName) {
+        String baseName = fileName;
+        String extension = "";
+
+        int lastDot = fileName.lastIndexOf('.');
+        if (lastDot > 0) {
+            baseName = fileName.substring(0, lastDot);
+            extension = fileName.substring(lastDot);
+        }
+
+        int counter = 1;
+        Path uniquePath;
+        do {
+            String newFileName = baseName + "_" + counter + extension;
+            uniquePath = targetDir.resolve(newFileName);
+            counter++;
+        } while (Files.exists(uniquePath));
+
+        return uniquePath;
     }
 }
