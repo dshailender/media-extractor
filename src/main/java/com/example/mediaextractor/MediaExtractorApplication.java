@@ -64,17 +64,41 @@ public class MediaExtractorApplication implements CommandLineRunner {
         Files.createDirectories(baseMemoriesDir);
         log.info("Base output directory ready at {}", baseMemoriesDir);
 
-        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+        int configuredThreads = environment.getProperty("media-extractor.threads", Integer.class, 0);
+        int maxInFlight = environment.getProperty("media-extractor.max-in-flight", Integer.class, 256);
+        long progressInterval = environment.getProperty("media-extractor.progress-interval-ms", Long.class, 5000L);
+        String configuredReportDirectory = environment.getProperty("media-extractor.report-directory", "");
+        Path reportDirectory = configuredReportDirectory.isBlank()
+            ? baseMemoriesDir
+            : Path.of(configuredReportDirectory).toAbsolutePath().normalize();
+
+        ExecutorService configuredExecutor = configuredThreads > 0
+            ? Executors.newFixedThreadPool(configuredThreads)
+            : Executors.newVirtualThreadPerTaskExecutor();
+        try (ExecutorService executor = configuredExecutor;
+             ProgressReporter progress = new ProgressReporter(mediaExtractorService.startReport(), progressInterval)) {
             Path tempDir = Files.createTempDirectory("media-extractor");
             log.info("Created temporary directory for archive extraction: {}", tempDir);
 
             mediaExtractorService.setExecutor(executor);
             mediaExtractorService.setTempDir(tempDir);
+            mediaExtractorService.setMaxInFlight(maxInFlight);
+            progress.start();
             mediaExtractorService.extractMedia(sourceDir, baseMemoriesDir);
             executor.shutdown();
             log.info("Waiting for extraction tasks to finish");
             if (!executor.awaitTermination(1, TimeUnit.DAYS)) {
                 log.error("Timed out while waiting for extraction tasks to complete");
+            }
+            mediaExtractorService.finishReport();
+            ExtractionReport report = mediaExtractorService.getLastReport();
+            if (report != null) {
+                ExtractionReportWriter.ReportPaths reportPaths = new ExtractionReportWriter()
+                    .write(report, reportDirectory, sourceDir.toString(), baseMemoriesDir.toString());
+                log.info("Extraction report written to JSON={} and HTML={}", reportPaths.json(), reportPaths.html());
+                log.info("Extraction summary: scanned={}, extracted={}, duplicates={}, corrupted={}, failed={}, durationMs={}, rate={}/s",
+                        report.scanned(), report.extracted(), report.duplicates(), report.corrupted(), report.failed(),
+                        report.durationMillis(), String.format("%.2f", report.filesPerSecond()));
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

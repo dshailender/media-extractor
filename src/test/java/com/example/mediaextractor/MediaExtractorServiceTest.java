@@ -6,6 +6,9 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
 
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -13,8 +16,11 @@ import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -80,6 +86,61 @@ class MediaExtractorServiceTest {
 
         int year = getYearFromFile(testFile);
         assertEquals(2023, year, "Year should be 2023");
+    }
+
+    @Test
+    void testYearExtractionPrefersExifDateForPhotos() throws IOException {
+        Path testFile = tempRoot.resolve("exif-photo.jpg");
+        byte[] jpegWithExif = createJpegWithExif("2022:06:15 10:30:00");
+        Files.write(testFile, jpegWithExif);
+
+        LocalDateTime dateTime2025 = LocalDateTime.of(2025, 1, 2, 3, 4, 5);
+        long millis2025 = dateTime2025.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+        Files.setLastModifiedTime(testFile, FileTime.fromMillis(millis2025));
+
+        int year = getYearFromFile(testFile);
+        assertEquals(2022, year, "Exif DateTimeOriginal should take precedence over file modification time");
+    }
+
+    @Test
+    void testDuplicateMediaFilesAreIgnored() throws IOException, InterruptedException {
+        Path sourceDir = tempRoot.resolve("source");
+        Files.createDirectories(sourceDir.resolve("sub1"));
+        Files.createDirectories(sourceDir.resolve("sub2"));
+
+        Path file1 = sourceDir.resolve("sub1").resolve("duplicate.jpg");
+        Path file2 = sourceDir.resolve("sub2").resolve("duplicate.jpg");
+        byte[] content = "same-image".getBytes(StandardCharsets.UTF_8);
+        Files.write(file1, content);
+        Files.write(file2, content);
+
+        service.extractMedia(sourceDir, baseMemoriesDir);
+        executor.shutdown();
+        executor.awaitTermination(60, java.util.concurrent.TimeUnit.SECONDS);
+
+        int currentYear = LocalDateTime.now().getYear();
+        Path photosDir = baseMemoriesDir.resolve(String.valueOf(currentYear)).resolve("photos");
+        assertTrue(Files.exists(photosDir.resolve("duplicate.jpg")), "One copy should be kept");
+        try (var stream = Files.list(photosDir)) {
+            assertEquals(1L, stream.count(), "Duplicate content should be deduplicated to a single file");
+        }
+    }
+
+    @Test
+    void testCorruptedPhotoIsSkipped() throws IOException, InterruptedException {
+        Path sourceDir = tempRoot.resolve("source");
+        Files.createDirectories(sourceDir);
+
+        Path corruptPhoto = sourceDir.resolve("broken.jpg");
+        Files.write(corruptPhoto, new byte[]{(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, 0x00, 0x00, 0x00});
+
+        service.extractMedia(sourceDir, baseMemoriesDir);
+        executor.shutdown();
+        executor.awaitTermination(60, java.util.concurrent.TimeUnit.SECONDS);
+
+        int currentYear = LocalDateTime.now().getYear();
+        Path photosDir = baseMemoriesDir.resolve(String.valueOf(currentYear)).resolve("photos");
+        assertFalse(Files.exists(photosDir.resolve("broken.jpg")), "Corrupted media should not be copied");
     }
 
     @Test
@@ -209,20 +270,30 @@ class MediaExtractorServiceTest {
         Path sourceDir = tempRoot.resolve("source");
         Files.createDirectories(sourceDir);
 
-        // For this test, we'll just verify the archive processing logic doesn't crash
-        // A full ZIP/TAR test would require creating actual archive files
-        
-        // Create a simple photo file
-        Path photo = sourceDir.resolve("photo.jpg");
-        Files.write(photo, "photo".getBytes(StandardCharsets.UTF_8));
+        Path innerArchive = tempRoot.resolve("inner.zip");
+        try (ZipOutputStream zipOut = new ZipOutputStream(Files.newOutputStream(innerArchive))) {
+            zipOut.putNextEntry(new ZipEntry("inner-photo.jpg"));
+            zipOut.write("nested-photo".getBytes(StandardCharsets.UTF_8));
+            zipOut.closeEntry();
+        }
+
+        Path outerArchive = sourceDir.resolve("outer.zip");
+        try (ZipOutputStream zipOut = new ZipOutputStream(Files.newOutputStream(outerArchive))) {
+            zipOut.putNextEntry(new ZipEntry("archive/inner.zip"));
+            zipOut.write(Files.readAllBytes(innerArchive));
+            zipOut.closeEntry();
+        }
 
         service.extractMedia(sourceDir, baseMemoriesDir);
         executor.shutdown();
-        executor.awaitTermination(60, java.util.concurrent.TimeUnit.SECONDS);
+        if (!executor.awaitTermination(60, java.util.concurrent.TimeUnit.SECONDS)) {
+            executor.shutdownNow();
+            fail("Nested archive extraction did not finish within the timeout");
+        }
 
         int currentYear = LocalDateTime.now().getYear();
         Path photosDir = baseMemoriesDir.resolve(String.valueOf(currentYear)).resolve("photos");
-        assertTrue(Files.exists(photosDir.resolve("photo.jpg")), "Photo should be extracted");
+        assertTrue(Files.exists(photosDir.resolve("inner-photo.jpg")), "Photo inside nested archive should be extracted");
     }
 
     @Test
@@ -294,5 +365,54 @@ class MediaExtractorServiceTest {
         LocalDateTime dateTime = LocalDateTime.of(year, 6, 15, 10, 30, 0);
         long millis = dateTime.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
         Files.setLastModifiedTime(file, FileTime.fromMillis(millis));
+    }
+
+    private byte[] createJpegWithExif(String dateTimeOriginal) throws IOException {
+        byte[] jpegBytes = createSimpleJpeg();
+        byte[] exifPayload = buildExifPayload(dateTimeOriginal);
+
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        result.write(new byte[]{(byte) 0xFF, (byte) 0xD8});
+        result.write(new byte[]{(byte) 0xFF, (byte) 0xE1});
+        result.write(new byte[]{(byte) ((exifPayload.length + 2) >> 8), (byte) ((exifPayload.length + 2) & 0xFF)});
+        result.write(exifPayload);
+        result.write(Arrays.copyOfRange(jpegBytes, 2, jpegBytes.length));
+        return result.toByteArray();
+    }
+
+    private byte[] createSimpleJpeg() throws IOException {
+        BufferedImage image = new BufferedImage(1, 1, BufferedImage.TYPE_INT_RGB);
+        try (ByteArrayOutputStream original = new ByteArrayOutputStream()) {
+            ImageIO.write(image, "jpg", original);
+            return original.toByteArray();
+        }
+    }
+
+    private byte[] buildExifPayload(String dateTimeOriginal) throws IOException {
+        byte[] ascii = (dateTimeOriginal + "\0").getBytes(StandardCharsets.US_ASCII);
+
+        ByteArrayOutputStream payload = new ByteArrayOutputStream();
+        payload.write(new byte[]{0x45, 0x78, 0x69, 0x66, 0x00, 0x00});
+
+        // TIFF header: little-endian, magic 42, IFD0 offset = 8
+        payload.write(new byte[]{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00});
+
+        // IFD0: 1 entry (ExifIFD pointer)
+        payload.write(new byte[]{0x01, 0x00});
+        payload.write(new byte[]{0x69, (byte) 0x87, 0x04, 0x00});
+        payload.write(new byte[]{0x01, 0x00, 0x00, 0x00});
+        payload.write(new byte[]{0x1A, 0x00, 0x00, 0x00});
+        payload.write(new byte[]{0x00, 0x00, 0x00, 0x00});
+
+        // ExifIFD: 1 entry (DateTimeOriginal)
+        payload.write(new byte[]{0x01, 0x00});
+        payload.write(new byte[]{0x03, (byte) 0x90, 0x02, 0x00});
+        payload.write(new byte[]{(byte) ascii.length, 0x00, 0x00, 0x00});
+        payload.write(new byte[]{0x2C, 0x00, 0x00, 0x00});
+        payload.write(new byte[]{0x00, 0x00, 0x00, 0x00});
+
+        // Date string at offset 44 from TIFF start
+        payload.write(ascii);
+        return payload.toByteArray();
     }
 }
