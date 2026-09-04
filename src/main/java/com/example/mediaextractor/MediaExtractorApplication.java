@@ -43,15 +43,32 @@ public class MediaExtractorApplication implements CommandLineRunner {
             return;
         }
 
+        String dateFormat = environment.getProperty("media-extractor.date-format", "yyyyMMdd_HHmmss");
+        String photoPrefix = environment.getProperty("media-extractor.photo-prefix", "IMG_");
+        String videoPrefix = environment.getProperty("media-extractor.video-prefix", "MOV_");
+        mediaExtractorService.getMetadataService().setDateFormatPattern(dateFormat);
+        mediaExtractorService.getMetadataService().setPhotoPrefix(photoPrefix);
+        mediaExtractorService.getMetadataService().setVideoPrefix(videoPrefix);
+
+        boolean sanitizeMode = Arrays.stream(args).anyMatch(a -> a.equalsIgnoreCase("--sanitize") || a.equalsIgnoreCase("--clean"));
+        Path baseMemoriesDir = Path.of(System.getProperty("user.home")).resolve("memories").toAbsolutePath().normalize();
+
+        if (sanitizeMode) {
+            log.info("Sanitization mode requested. Sanitizing existing memories at {}", baseMemoriesDir);
+            MediaExtractorService.SanitizationReport report = mediaExtractorService.sanitizeMemories(baseMemoriesDir);
+            log.info("Sanitization completed: scanned={}, valid={}, corrupted={}, duplicates={}, renamed={}, cleanedDirectories={}",
+                    report.scanned(), report.valid(), report.corrupted(), report.duplicates(), report.renamed(), report.cleanedDirectories());
+            return;
+        }
+
         String sourceArgument = Arrays.stream(args)
+                .filter(a -> !a.startsWith("--"))
                 .findFirst()
                 .orElse(null);
 
         Path sourceDir = sourceArgument != null
                 ? Path.of(sourceArgument).toAbsolutePath().normalize()
                 : Path.of("C:\\Users\\Shailender\\projects\\backup").toAbsolutePath().normalize();
-        
-        Path baseMemoriesDir = Path.of(System.getProperty("user.home")).resolve("memories").toAbsolutePath().normalize();
 
         log.info("Starting media extraction workflow with sourceDir={}, outputBaseDir={}",
                 sourceDir, baseMemoriesDir);
@@ -80,9 +97,14 @@ public class MediaExtractorApplication implements CommandLineRunner {
             Path tempDir = Files.createTempDirectory("media-extractor");
             log.info("Created temporary directory for archive extraction: {}", tempDir);
 
+            boolean quarantineEnabled = environment.getProperty("media-extractor.quarantine-enabled", Boolean.class, true);
+            boolean preserveTimestamps = environment.getProperty("media-extractor.preserve-timestamps", Boolean.class, true);
+
             mediaExtractorService.setExecutor(executor);
             mediaExtractorService.setTempDir(tempDir);
             mediaExtractorService.setMaxInFlight(maxInFlight);
+            mediaExtractorService.setQuarantineEnabled(quarantineEnabled);
+            mediaExtractorService.setPreserveTimestamps(preserveTimestamps);
             progress.start();
             mediaExtractorService.extractMedia(sourceDir, baseMemoriesDir);
             executor.shutdown();
@@ -96,8 +118,8 @@ public class MediaExtractorApplication implements CommandLineRunner {
                 ExtractionReportWriter.ReportPaths reportPaths = new ExtractionReportWriter()
                     .write(report, reportDirectory, sourceDir.toString(), baseMemoriesDir.toString());
                 log.info("Extraction report written to JSON={} and HTML={}", reportPaths.json(), reportPaths.html());
-                log.info("Extraction summary: scanned={}, extracted={}, duplicates={}, corrupted={}, failed={}, durationMs={}, rate={}/s",
-                        report.scanned(), report.extracted(), report.duplicates(), report.corrupted(), report.failed(),
+                log.info("Extraction summary: scanned={}, extracted={}, duplicates={}, corrupted={}, quarantined={}, failed={}, durationMs={}, rate={}/s",
+                        report.scanned(), report.extracted(), report.duplicates(), report.corrupted(), report.quarantined(), report.failed(),
                         report.durationMillis(), String.format("%.2f", report.filesPerSecond()));
             }
         } catch (InterruptedException e) {

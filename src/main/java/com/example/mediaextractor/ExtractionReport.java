@@ -21,6 +21,7 @@ final class ExtractionReport {
     private final AtomicLong bytesWritten = new AtomicLong();
     private final AtomicLong inFlight = new AtomicLong();
     private final AtomicLong peakInFlight = new AtomicLong();
+    private final AtomicLong quarantined = new AtomicLong();
     private final ConcurrentHashMap<String, AtomicLong> byType = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<Integer, AtomicLong>> byTypeAndYear = new ConcurrentHashMap<>();
     private final List<Failure> failures = Collections.synchronizedList(new ArrayList<>());
@@ -41,10 +42,17 @@ final class ExtractionReport {
         byTypeAndYear.computeIfAbsent(type, ignored -> new ConcurrentHashMap<>())
                 .computeIfAbsent(year, ignored -> new AtomicLong()).incrementAndGet();
     }
-    void duplicate(String source) { duplicates.incrementAndGet(); failures.add(new Failure(source, "duplicate", "content already extracted")); }
-    void corrupted(String source, String reason) { corrupted.incrementAndGet(); failures.add(new Failure(source, "corruption", reason)); }
-    void failed(String source, String stage, String reason) { failed.incrementAndGet(); failures.add(new Failure(source, stage, reason)); }
+    void duplicate(String source) { duplicates.incrementAndGet(); addFailure(new Failure(source, "duplicate", "content already extracted")); }
+    void corrupted(String source, String reason) { corrupted.incrementAndGet(); addFailure(new Failure(source, "corruption", reason)); }
+    void quarantined(String source, String reason) { quarantined.incrementAndGet(); addFailure(new Failure(source, "quarantine", reason)); }
+    void failed(String source, String stage, String reason) { failed.incrementAndGet(); addFailure(new Failure(source, stage, reason)); }
     void finish() { finishedAt = Instant.now(); }
+
+    private void addFailure(Failure failure) {
+        if (failures.size() < 10000) {
+            failures.add(failure);
+        }
+    }
 
     Instant startedAt() { return startedAt; }
     Instant finishedAt() { return finishedAt; }
@@ -55,6 +63,7 @@ final class ExtractionReport {
     long extracted() { return extracted.get(); }
     long duplicates() { return duplicates.get(); }
     long corrupted() { return corrupted.get(); }
+    long quarantined() { return quarantined.get(); }
     long failed() { return failed.get(); }
     long bytesWritten() { return bytesWritten.get(); }
     long peakInFlight() { return peakInFlight.get(); }

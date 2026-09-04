@@ -19,9 +19,9 @@ final class ProgressReporter implements AutoCloseable {
         running = true;
         thread = Thread.startVirtualThread(() -> {
             while (running) {
-                log.info("Progress: scanned={}, completed={}, in-flight={}, extracted={}, duplicates={}, corrupted={}, failed={}, rate={}/s",
+                log.info("Progress: scanned={}, completed={}, in-flight={}, extracted={}, duplicates={}, corrupted={}, quarantined={}, failed={}, rate={}/s",
                         report.scanned(), report.completed(), report.inFlight(), report.extracted(),
-                        report.duplicates(), report.corrupted(), report.failed(), String.format("%.2f", report.filesPerSecond()));
+                        report.duplicates(), report.corrupted(), report.quarantined(), report.failed(), String.format("%.2f", report.filesPerSecond()));
                 try {
                     Thread.sleep(intervalMillis);
                 } catch (InterruptedException e) {

@@ -49,6 +49,7 @@ final class ExtractionReportWriter {
         number(json, "extracted", report.extracted(), true);
         number(json, "duplicates", report.duplicates(), true);
         number(json, "corrupted", report.corrupted(), true);
+        number(json, "quarantined", report.quarantined(), true);
         number(json, "failed", report.failed(), true);
         number(json, "bytesWritten", report.bytesWritten(), true);
         number(json, "peakInFlight", report.peakInFlight(), true);
@@ -70,7 +71,7 @@ final class ExtractionReportWriter {
         html.append("<h1>Media extraction report</h1><p>Source: <code>").append(escape(source)).append("</code><br>Output: <code>").append(escape(output)).append("</code></p>");
         html.append("<table><tr><th>Metric</th><th>Value</th></tr>");
         metric(html, "Scanned", report.scanned()); metric(html, "Extracted", report.extracted()); metric(html, "Duplicates", report.duplicates());
-        metric(html, "Corrupted", report.corrupted()); metric(html, "Failed", report.failed()); metric(html, "Duration (ms)", report.durationMillis());
+        metric(html, "Corrupted", report.corrupted()); metric(html, "Quarantined", report.quarantined()); metric(html, "Failed", report.failed()); metric(html, "Duration (ms)", report.durationMillis());
         metric(html, "Files/second", report.filesPerSecond()); metric(html, "Bytes written", report.bytesWritten()); metric(html, "Peak in-flight", report.peakInFlight());
         html.append("</table><h2>Failures and skips</h2><ul>");
         for (var failure : report.failures()) html.append("<li><strong>").append(escape(failure.stage())).append("</strong> ").append(escape(failure.source())).append(": ").append(escape(failure.reason())).append("</li>");
