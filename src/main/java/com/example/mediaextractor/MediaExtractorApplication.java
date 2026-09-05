@@ -133,10 +133,41 @@ public class MediaExtractorApplication implements CommandLineRunner {
             mediaExtractorService.cleanupTempDir();
         }
 
+        Boolean classifierEnabledOverride = null;
+        String classifierActionOverride = null;
+        Boolean classifierQuarantineOverride = null;
+
+        for (String arg : args) {
+            String lower = arg.toLowerCase();
+            if (lower.equals("--classify")) {
+                classifierEnabledOverride = true;
+            } else if (lower.equals("--no-classify")) {
+                classifierEnabledOverride = false;
+            } else if (lower.equals("--move") || lower.equals("--action=move")) {
+                classifierEnabledOverride = true;
+                classifierActionOverride = "move";
+            } else if (lower.equals("--dry-run") || lower.equals("--action=dry-run")) {
+                classifierEnabledOverride = true;
+                classifierActionOverride = "dry-run";
+            } else if (lower.equals("--copy") || lower.equals("--action=copy")) {
+                classifierEnabledOverride = true;
+                classifierActionOverride = "copy";
+            } else if (lower.equals("--quarantine") || lower.equals("--quarantine-memes")) {
+                classifierQuarantineOverride = true;
+            } else if (lower.equals("--no-quarantine")) {
+                classifierQuarantineOverride = false;
+            }
+        }
+
         classifierProcessService.classifyAfterExtraction(
             baseMemoriesDir,
             mediaExtractorService.getExtractedImagePaths(),
-            environment);
+            environment,
+            new PythonClassifierProcessService.ClassifierOptions(
+                classifierEnabledOverride,
+                classifierActionOverride,
+                classifierQuarantineOverride
+            ));
 
         log.info("Media extraction workflow completed");
     }

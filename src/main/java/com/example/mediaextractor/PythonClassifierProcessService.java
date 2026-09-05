@@ -23,8 +23,24 @@ public class PythonClassifierProcessService {
     private static final Logger log = LoggerFactory.getLogger(PythonClassifierProcessService.class);
     private static final long DEFAULT_TIMEOUT_MINUTES = 1_440L;
 
+    public record ClassifierOptions(
+        Boolean enabledOverride,
+        String actionOverride,
+        Boolean quarantineOverride
+    ) {
+        public static ClassifierOptions defaults() {
+            return new ClassifierOptions(null, null, null);
+        }
+    }
+
     public void classifyAfterExtraction(Path memoriesDir, List<Path> imagePaths, Environment environment) {
-        boolean enabled = environment.getProperty("media-extractor.classifier-enabled", Boolean.class, false);
+        classifyAfterExtraction(memoriesDir, imagePaths, environment, ClassifierOptions.defaults());
+    }
+
+    public void classifyAfterExtraction(Path memoriesDir, List<Path> imagePaths, Environment environment, ClassifierOptions options) {
+        boolean enabled = options != null && options.enabledOverride() != null
+                ? options.enabledOverride()
+                : environment.getProperty("media-extractor.classifier-enabled", Boolean.class, true);
         if (!enabled) {
             return;
         }
@@ -36,11 +52,17 @@ public class PythonClassifierProcessService {
         Path workingDirectory = resolvePath(environment.getProperty("media-extractor.classifier-working-directory", ""), Path.of("."));
         Path python = resolvePath(environment.getProperty("media-extractor.classifier-python", ".venv/bin/python"), workingDirectory);
         Path script = resolvePath(environment.getProperty("media-extractor.classifier-script", "scripts/classify_memes.py"), workingDirectory);
-        String action = environment.getProperty("media-extractor.classifier-action", "dry-run");
+        String action = options != null && options.actionOverride() != null
+                ? options.actionOverride()
+                : environment.getProperty("media-extractor.classifier-action", "move");
         if (!List.of("dry-run", "copy", "move").contains(action)) {
             log.error("Invalid classifier action '{}'; expected dry-run, copy, or move", action);
             return;
         }
+
+        boolean quarantine = options != null && options.quarantineOverride() != null
+                ? options.quarantineOverride()
+                : environment.getProperty("media-extractor.classifier-quarantine", Boolean.class, true);
 
         Path manifest = null;
     Process process = null;
@@ -49,13 +71,7 @@ public class PythonClassifierProcessService {
             Files.write(manifest, imagePaths.stream().map(path -> path.toAbsolutePath().normalize().toString()).toList(),
                     StandardCharsets.UTF_8);
 
-            List<String> command = new ArrayList<>(List.of(
-                    python.toString(), script.toString(),
-                    "--source-dir", memoriesDir.toAbsolutePath().normalize().toString(),
-                    "--input-manifest", manifest.toString(),
-                    "--action", action));
-            addOptionalArgument(command, environment, "media-extractor.classifier-output-csv", "--output-csv");
-            addOptionalArgument(command, environment, "media-extractor.classifier-review-csv", "--review-csv");
+            List<String> command = buildCommand(python, script, memoriesDir, manifest, action, quarantine, environment);
 
             log.info("Starting Python classifier for {} extracted images using {}", imagePaths.size(), script);
                 Process startedProcess = new ProcessBuilder(command)
@@ -94,6 +110,29 @@ public class PythonClassifierProcessService {
                 }
             }
         }
+    }
+
+    static List<String> buildCommand(
+            Path python,
+            Path script,
+            Path memoriesDir,
+            Path manifest,
+            String action,
+            boolean quarantine,
+            Environment environment) {
+        List<String> command = new ArrayList<>(List.of(
+                python.toString(), script.toString(),
+                "--source-dir", memoriesDir.toAbsolutePath().normalize().toString(),
+                "--input-manifest", manifest.toString(),
+                "--action", action));
+        if (quarantine) {
+            command.add("--quarantine");
+        }
+        if (environment != null) {
+            addOptionalArgument(command, environment, "media-extractor.classifier-output-csv", "--output-csv");
+            addOptionalArgument(command, environment, "media-extractor.classifier-review-csv", "--review-csv");
+        }
+        return command;
     }
 
     private static void addOptionalArgument(List<String> command, Environment environment, String property, String option) {

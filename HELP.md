@@ -22,11 +22,18 @@ If you manually switch to a different parent and actually want the inheritance, 
 ### Use below command to run the application
 
 ```bash
+# Unified extraction + classification + move to quarantine (Default):
 java -jar target/media-extractor-0.0.1-SNAPSHOT.jar [<sourceDir>]
+
+# Or use the convenience script:
+./scripts/run_pipeline.sh /path/to/source
 ```
 
-**Arguments:**
+**Arguments & Shorthand Flags:**
 - `<sourceDir>` (optional): Source directory containing media and archives. Defaults to `C:\Users\Shailender\projects\backup`
+- `--dry-run`: Runs classifier in audit mode (inspects and logs without moving memes/greetings).
+- `--no-classify`: Skips the Python classifier entirely (pure extraction only).
+- `--no-quarantine`: Moves memes/greetings to `~/memories/{YYYY}/` instead of `~/memories/quarantine/{YYYY}/`.
 - `--sanitize` or `--clean`: Runs in sanitization mode to audit existing files in `~/memories/`, quarantines any corrupted files, removes duplicates, and prunes empty directories without performing a new source extraction.
 
 **Output Directory Structure:**
@@ -160,22 +167,21 @@ export GEMINI_API_KEY="your_api_key_here"
 .venv/bin/python scripts/classify_memes.py --source-dir ~/memories/quarantine/2017 --action move --rescue
 ```
 
-To invoke the Python classifier automatically after a normal Java extraction run, enable it in
-`src/main/resources/application.properties` or with Spring command-line properties:
+The Python classifier is enabled by default to run automatically after extraction.
+Its behavior is configured in `src/main/resources/application.properties` or overridden via CLI flags:
 
 ```properties
 media-extractor.classifier-enabled=true
-media-extractor.classifier-working-directory=/home/user/projects/media-extractor
+media-extractor.classifier-action=move
+media-extractor.classifier-quarantine=true
 media-extractor.classifier-python=.venv/bin/python
 media-extractor.classifier-script=scripts/classify_memes.py
-media-extractor.classifier-action=dry-run
+media-extractor.classifier-working-directory=.
 ```
 
-The default action is `dry-run`; use `copy` or `move` only when automatic relocation is intended.
-Java writes a temporary manifest containing only photo files successfully produced by the current
-extraction run, including photos found inside archives, and passes it with `--input-manifest`.
-Existing files elsewhere under `~/memories` are not classified by this automatic hook. The Python
-script can still be run directly with `--source-dir` for a full-tree scan.
+- By default, action is `move` and quarantine is `true`, routing memes and greetings directly into `~/memories/quarantine/{YYYY}/`.
+- Use `--dry-run` to inspect without moving, or `--no-classify` to disable the classifier.
+- Java writes a temporary manifest containing only photo files successfully extracted by the current run, including photos from nested archives, and passes it via `--input-manifest`. Existing files elsewhere under `~/memories/` are not touched. The Python script can still be run standalone directly with `--source-dir` for a full directory scan.
 
 Automatic classification is skipped for `--sanitize`/`--clean`, the `test` profile, and runs that
 extract no photos. Python startup failures, nonzero exit codes, and timeouts are logged while the
