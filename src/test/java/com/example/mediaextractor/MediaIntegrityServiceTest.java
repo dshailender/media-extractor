@@ -132,6 +132,25 @@ class MediaIntegrityServiceTest {
         assertTrue(Files.exists(quarantined));
         assertTrue(quarantined.toString().contains("quarantine"));
         assertTrue(quarantined.toString().contains("photos"));
+        assertTrue(Files.exists(source), "Source file should remain for quarantineFile copy operation");
+    }
+
+    @Test
+    void testRelocateToQuarantineUsingAtomicMove(@TempDir Path tempDir) throws IOException {
+        Path memories = tempDir.resolve("memories");
+        Path yearPhotos = memories.resolve("2024").resolve("photos");
+        Files.createDirectories(yearPhotos);
+
+        Path source = yearPhotos.resolve("corrupted_photo.jpg");
+        Files.writeString(source, "BROKEN_PAYLOAD");
+
+        Path quarantined = integrityService.quarantineAndRemove(source, memories, 2024, "photo", "corrupted test file");
+
+        assertNotNull(quarantined);
+        assertTrue(Files.exists(quarantined), "Relocated file must exist in quarantine");
+        assertFalse(Files.exists(source), "Source file must be moved/removed from original location");
+        assertTrue(quarantined.toString().contains("quarantine"));
+        assertEquals("BROKEN_PAYLOAD", Files.readString(quarantined));
     }
 
     private byte[] createSimpleJpeg() throws IOException {

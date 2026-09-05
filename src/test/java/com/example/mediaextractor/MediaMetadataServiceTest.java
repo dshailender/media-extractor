@@ -19,7 +19,9 @@ import java.time.ZoneId;
 import java.util.Arrays;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class MediaMetadataServiceTest {
 
@@ -117,6 +119,43 @@ class MediaMetadataServiceTest {
         assertNotNull(meta);
         assertEquals(2023, meta.year());
         assertEquals("filename-regex", meta.source());
+    }
+
+    @Test
+    void testIsAlreadyFormatted() {
+        assertTrue(metadataService.isAlreadyFormatted("IMG_20231104_123045.jpg"));
+        assertTrue(metadataService.isAlreadyFormatted("IMG_20231104_123045_1.jpg"));
+        assertTrue(metadataService.isAlreadyFormatted("MOV_20220510_124530.mov"));
+        assertTrue(metadataService.isAlreadyFormatted("MOV_20220510_124530_3.mp4"));
+
+        assertFalse(metadataService.isAlreadyFormatted("photo.jpg"));
+        assertFalse(metadataService.isAlreadyFormatted("IMG_0042.jpg"));
+        assertFalse(metadataService.isAlreadyFormatted("sample.png"));
+        assertFalse(metadataService.isAlreadyFormatted("IMG_abcd.jpg"));
+        assertFalse(metadataService.isAlreadyFormatted(null));
+        assertFalse(metadataService.isAlreadyFormatted(""));
+    }
+
+    @Test
+    void testFastPathSkipsExifParsingForAlreadyFormattedFile(@TempDir Path tempDir) throws IOException {
+        Path photo = tempDir.resolve("IMG_20240510_123000.jpg");
+        // Create JPEG with EXIF date in 2018
+        byte[] jpegWithExif = createJpegWithExif("2018:01:01 00:00:00");
+        Files.write(photo, jpegWithExif);
+
+        // Fast-path should extract 2024 from filename directly, bypassing 2018 EXIF
+        MediaMetadataService.Metadata meta = metadataService.extractMetadata(photo);
+        assertNotNull(meta);
+        assertEquals(2024, meta.year());
+        assertEquals("filename-regex", meta.source());
+
+        // For non-formatted filename with the same EXIF bytes, EXIF is parsed and yields 2018
+        Path unformatted = tempDir.resolve("camera_photo.jpg");
+        Files.write(unformatted, jpegWithExif);
+        MediaMetadataService.Metadata unformattedMeta = metadataService.extractMetadata(unformatted);
+        assertNotNull(unformattedMeta);
+        assertEquals(2018, unformattedMeta.year());
+        assertEquals("exif", unformattedMeta.source());
     }
 
     @Test

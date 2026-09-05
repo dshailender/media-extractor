@@ -338,15 +338,7 @@ public class MediaIntegrityService {
             Files.createDirectories(quarantineDir);
 
             String fileName = sourceFile.getFileName().toString();
-            Path targetFile = quarantineDir.resolve(fileName);
-            int counter = 1;
-            while (Files.exists(targetFile)) {
-                int dot = fileName.lastIndexOf('.');
-                String base = dot > 0 ? fileName.substring(0, dot) : fileName;
-                String ext = dot > 0 ? fileName.substring(dot) : "";
-                targetFile = quarantineDir.resolve(base + "_" + counter + ext);
-                counter++;
-            }
+            Path targetFile = resolveUniqueQuarantinePath(quarantineDir, fileName);
 
             Files.copy(sourceFile, targetFile, StandardCopyOption.REPLACE_EXISTING);
             log.warn("Quarantined corrupted file: {} -> {} (reason: {})", sourceFile, targetFile, reason);
@@ -357,16 +349,51 @@ public class MediaIntegrityService {
         }
     }
 
-    public Path quarantineAndRemove(Path sourceFile, Path baseMemoriesDir, int year, String mediaType, String reason) {
-        Path quarantined = quarantineFile(sourceFile, baseMemoriesDir, year, mediaType, reason);
-        if (quarantined != null) {
+    public Path relocateToQuarantine(Path sourceFile, Path baseMemoriesDir, int year, String mediaType, String reason) {
+        try {
+            String folderName = mediaType.endsWith("s") ? mediaType : mediaType + "s";
+            Path quarantineDir = baseMemoriesDir.resolve("quarantine")
+                    .resolve(String.valueOf(year))
+                    .resolve(folderName);
+            Files.createDirectories(quarantineDir);
+
+            String fileName = sourceFile.getFileName().toString();
+            Path targetFile = resolveUniqueQuarantinePath(quarantineDir, fileName);
+
             try {
-                Files.deleteIfExists(sourceFile);
+                Files.move(sourceFile, targetFile, StandardCopyOption.ATOMIC_MOVE);
             } catch (IOException e) {
-                log.warn("Failed to delete source file after quarantine: {}", sourceFile, e);
+                try {
+                    Files.move(sourceFile, targetFile, StandardCopyOption.REPLACE_EXISTING);
+                } catch (IOException ex) {
+                    Files.copy(sourceFile, targetFile, StandardCopyOption.REPLACE_EXISTING);
+                    Files.deleteIfExists(sourceFile);
+                }
             }
+
+            log.warn("Quarantined and relocated file: {} -> {} (reason: {})", sourceFile, targetFile, reason);
+            return targetFile;
+        } catch (IOException e) {
+            log.error("Failed to relocate file to quarantine {}: {}", sourceFile, e.getMessage());
+            return null;
         }
-        return quarantined;
+    }
+
+    public Path quarantineAndRemove(Path sourceFile, Path baseMemoriesDir, int year, String mediaType, String reason) {
+        return relocateToQuarantine(sourceFile, baseMemoriesDir, year, mediaType, reason);
+    }
+
+    public Path resolveUniqueQuarantinePath(Path quarantineDir, String fileName) {
+        Path targetFile = quarantineDir.resolve(fileName);
+        int counter = 1;
+        while (Files.exists(targetFile)) {
+            int dot = fileName.lastIndexOf('.');
+            String base = dot > 0 ? fileName.substring(0, dot) : fileName;
+            String ext = dot > 0 ? fileName.substring(dot) : "";
+            targetFile = quarantineDir.resolve(base + "_" + counter + ext);
+            counter++;
+        }
+        return targetFile;
     }
 
     private byte[] readHeaderBytes(Path file, int count) {

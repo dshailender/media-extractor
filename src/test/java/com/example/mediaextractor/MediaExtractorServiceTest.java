@@ -514,6 +514,64 @@ class MediaExtractorServiceTest {
         assertTrue(Files.exists(baseMemoriesDir.resolve("quarantine").resolve("2002").resolve("photos").resolve("corrupt2.bmp")));
     }
 
+    @Test
+    void testSanitizeMemoriesWithMultiTierDeduplicationAndFastPathNaming() throws IOException {
+        Path photos2023 = baseMemoriesDir.resolve("2023").resolve("photos");
+        Path videos2023 = baseMemoriesDir.resolve("2023").resolve("videos");
+        Path photos2019 = baseMemoriesDir.resolve("2019").resolve("photos");
+        Files.createDirectories(photos2023);
+        Files.createDirectories(videos2023);
+        Files.createDirectories(photos2019);
+
+        byte[] jpegContent1 = createSimpleJpeg(0xFF0000);
+        byte[] jpegContent2 = createSimpleJpeg(0x00FF00); // Different content
+
+        // 1. Already formatted photo
+        Path formattedPhoto = photos2023.resolve("IMG_20230501_100000.jpg");
+        Files.write(formattedPhoto, jpegContent1);
+
+        // 2. Duplicate of formatted photo
+        Path duplicatePhoto = photos2023.resolve("IMG_20230501_100000_1.jpg");
+        Files.write(duplicatePhoto, jpegContent1);
+
+        // 3. Unformatted photo (should be renamed)
+        Path unformattedPhoto = photos2023.resolve("camera_raw_shot.jpg");
+        Files.write(unformattedPhoto, jpegContent2);
+
+        // 4. Already formatted video
+        Path formattedVideo = videos2023.resolve("MOV_20230501_100000.mp4");
+        Files.write(formattedVideo, createSimpleMp4());
+
+        // 5. Corrupt photo in 2019 (empty 2019 directory will be cleaned)
+        Path corruptPhoto = photos2019.resolve("corrupt.jpg");
+        Files.writeString(corruptPhoto, "BAD_CORRUPT_BYTES");
+
+        MediaExtractorService.SanitizationReport report = service.sanitizeMemories(baseMemoriesDir);
+
+        assertEquals(5, report.scanned(), "Scanned count should be 5");
+        assertEquals(3, report.valid(), "3 files should be valid (1 formatted photo, 1 renamed photo, 1 formatted video)");
+        assertEquals(1, report.corrupted(), "1 file corrupted");
+        assertEquals(1, report.duplicates(), "1 duplicate identified via multi-tier deduplication");
+        assertEquals(1, report.renamed(), "Only the unformatted photo should be renamed; already-formatted files skip renaming");
+        assertEquals(1, report.cleanedDirectories(), "2019 directory must be pruned");
+
+        // Verify quarantine contains corrupt and duplicate files
+        assertTrue(Files.exists(baseMemoriesDir.resolve("quarantine").resolve("2019").resolve("photos").resolve("corrupt.jpg")));
+        assertTrue(Files.exists(baseMemoriesDir.resolve("quarantine").resolve("2023").resolve("photos").resolve("IMG_20230501_100000_1.jpg")));
+
+        // Verify photos2023 directory has 2 files, both named IMG_...
+        try (var stream = Files.list(photos2023)) {
+            var files = stream.toList();
+            assertEquals(2, files.size());
+            for (Path f : files) {
+                assertTrue(f.getFileName().toString().startsWith("IMG_"));
+            }
+        }
+
+        // Verify 2019 was pruned
+        assertFalse(Files.exists(baseMemoriesDir.resolve("2019")));
+    }
+
     // Helper methods using reflection to access private methods
     private int getYearFromFile(Path file) throws IOException {
         try {

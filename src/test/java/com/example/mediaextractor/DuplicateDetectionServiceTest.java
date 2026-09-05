@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -83,6 +84,56 @@ class DuplicateDetectionServiceTest {
         Path file2 = tempDir.resolve("different.jpg");
         Files.writeString(file2, "other-content");
         assertFalse(duplicateService.targetMatchesContent(file2, digest));
+    }
+
+    @Test
+    void testDetectDuplicatesMultiTierExactSizeGrouping(@TempDir Path tempDir) throws IOException {
+        Path file1 = tempDir.resolve("unique1.jpg");
+        Path file2 = tempDir.resolve("unique2.jpg");
+        Path file3 = tempDir.resolve("unique3.jpg");
+
+        // 3 files with completely different sizes
+        Files.writeString(file1, "A");
+        Files.writeString(file2, "BB");
+        Files.writeString(file3, "CCC");
+
+        var result = duplicateService.detectDuplicatesMultiTier(List.of(file1, file2, file3));
+        assertEquals(0, result.duplicates().size(), "Files with unique sizes must not have any duplicates");
+        assertEquals(3, result.validFiles().size());
+        assertTrue(result.fullDigests().isEmpty(), "No full digests should be calculated for unique sizes (Zero-I/O)");
+    }
+
+    @Test
+    void testDetectDuplicatesMultiTierSparseHashDifferentiates(@TempDir Path tempDir) throws IOException {
+        Path file1 = tempDir.resolve("same_size1.jpg");
+        Path file2 = tempDir.resolve("same_size2.jpg");
+
+        // Exact same length (10 chars), but differing content in sparse sample
+        Files.writeString(file1, "0123456789");
+        Files.writeString(file2, "abcdefghij");
+
+        var result = duplicateService.detectDuplicatesMultiTier(List.of(file1, file2));
+        assertEquals(0, result.duplicates().size());
+        assertEquals(2, result.validFiles().size());
+        assertTrue(result.fullDigests().isEmpty(), "Differing sparse hashes should not escalate to full digest");
+    }
+
+    @Test
+    void testDetectDuplicatesMultiTierFullSha256Escalation(@TempDir Path tempDir) throws IOException {
+        Path file1 = tempDir.resolve("original.jpg");
+        Path file2 = tempDir.resolve("duplicate.jpg");
+        Path file3 = tempDir.resolve("another_unique.jpg");
+
+        String identicalContent = "EXACT_DUPLICATE_CONTENT_12345";
+        Files.writeString(file1, identicalContent);
+        Files.writeString(file2, identicalContent);
+        Files.writeString(file3, "DIFFERENT_LENGTH_CONTENT");
+
+        var result = duplicateService.detectDuplicatesMultiTier(List.of(file1, file2, file3));
+        assertEquals(1, result.duplicates().size(), "Exactly 1 duplicate file should be identified");
+        assertTrue(result.duplicates().contains(file2) || result.duplicates().contains(file1));
+        assertEquals(2, result.validFiles().size(), "Original + another unique must be valid");
+        assertFalse(result.fullDigests().isEmpty(), "Escalated pair must have full digests recorded");
     }
 }
 

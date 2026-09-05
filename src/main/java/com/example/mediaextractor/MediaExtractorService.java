@@ -12,8 +12,10 @@ import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
@@ -25,7 +27,15 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -512,22 +522,36 @@ public class MediaExtractorService {
 
     public record SanitizationReport(int scanned, int valid, int corrupted, int duplicates, int renamed, int cleanedDirectories) {}
 
+    private record SanitizationCandidate(
+            Path file,
+            Path typeDir,
+            Path yearDir,
+            int year,
+            String mediaType,
+            String fileName
+    ) {}
+
     public SanitizationReport sanitizeMemories(Path baseMemoriesDir) {
         log.info("Starting sanitization of memories directory: {}", baseMemoriesDir);
         duplicateService.clear();
-
-        int scanned = 0;
-        int valid = 0;
-        int corrupted = 0;
-        int duplicates = 0;
-        int renamed = 0;
-        int cleanedDirs = 0;
 
         if (!Files.exists(baseMemoriesDir)) {
             log.warn("Base memories directory does not exist: {}", baseMemoriesDir);
             return new SanitizationReport(0, 0, 0, 0, 0, 0);
         }
 
+        AtomicInteger scannedCount = new AtomicInteger();
+        AtomicInteger validCount = new AtomicInteger();
+        AtomicInteger corruptedCount = new AtomicInteger();
+        AtomicInteger duplicatesCount = new AtomicInteger();
+        AtomicInteger renamedCount = new AtomicInteger();
+        AtomicInteger cleanedDirs = new AtomicInteger();
+
+        List<SanitizationCandidate> allCandidates = new ArrayList<>();
+        List<Path> typeDirectories = new ArrayList<>();
+        List<Path> yearDirectories = new ArrayList<>();
+
+        // Discovery phase
         try (var yearEntries = Files.list(baseMemoriesDir)) {
             for (Path yearDir : yearEntries.toList()) {
                 if (!Files.isDirectory(yearDir)) continue;
@@ -536,6 +560,7 @@ public class MediaExtractorService {
                     continue;
                 }
 
+                yearDirectories.add(yearDir);
                 int year;
                 try {
                     year = Integer.parseInt(yearName);
@@ -546,89 +571,152 @@ public class MediaExtractorService {
                 for (String mediaType : new String[]{"photo", "video"}) {
                     Path typeDir = yearDir.resolve(mediaType + "s");
                     if (!Files.exists(typeDir) || !Files.isDirectory(typeDir)) continue;
+                    typeDirectories.add(typeDir);
 
                     try (var files = Files.list(typeDir)) {
                         for (Path file : files.toList()) {
                             if (!Files.isRegularFile(file)) continue;
-                            scanned++;
-                            String fileName = file.getFileName().toString();
-
-                            if (integrityService.isCorrupted(file, fileName)) {
-                                log.warn("Sanitizing corrupted file in memories: {}", file);
-                                integrityService.quarantineAndRemove(file, baseMemoriesDir, year, mediaType, "corrupted file detected during sanitization");
-                                corrupted++;
-                            } else {
-                                String digest = duplicateService.computeFullDigest(file);
-                                if (digest != null && duplicateService.isDuplicate(digest)) {
-                                    log.info("Sanitizing duplicate file in memories: {}", file);
-                                    integrityService.quarantineAndRemove(file, baseMemoriesDir, year, mediaType, "duplicate file detected during sanitization");
-                                    duplicates++;
-                                } else {
-                                    if (digest != null) {
-                                        try {
-                                            duplicateService.registerDigest(digest, Files.size(file), file);
-                                        } catch (IOException ignored) {}
-                                    }
-                                    valid++;
-
-                                    // Renaming pass: ensure file is named with IMG_ / MOV_ timestamp format
-                                    MediaMetadataService.Metadata meta = metadataService.extractMetadata(file);
-                                    String targetName = metadataService.generateTargetFileName(mediaType, meta.captureInstant(), fileName);
-                                    if (!fileName.equals(targetName)) {
-                                        Path targetFile = typeDir.resolve(targetName);
-                                        if (Files.exists(targetFile) && !targetFile.equals(file)) {
-                                            targetFile = duplicateService.getUniqueFileName(typeDir, targetName);
-                                        }
-                                        try {
-                                            Files.move(file, targetFile, StandardCopyOption.ATOMIC_MOVE);
-                                            renamed++;
-                                            log.debug("Renamed memory file: {} -> {}", fileName, targetFile.getFileName());
-                                        } catch (IOException e) {
-                                            try {
-                                                Files.move(file, targetFile);
-                                                renamed++;
-                                            } catch (IOException ex) {
-                                                log.warn("Failed to rename {} to {}: {}", fileName, targetFile, ex.getMessage());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            scannedCount.incrementAndGet();
+                            allCandidates.add(new SanitizationCandidate(
+                                    file, typeDir, yearDir, year, mediaType, file.getFileName().toString()
+                            ));
                         }
                     } catch (IOException e) {
                         log.error("Error reading directory {}", typeDir, e);
                     }
-
-                    // Remove empty type directory
-                    try {
-                        if (isDirectoryEmpty(typeDir)) {
-                            Files.delete(typeDir);
-                        }
-                    } catch (IOException ignored) {}
                 }
-
-                // Remove empty year directory
-                try {
-                    if (isDirectoryEmpty(yearDir)) {
-                        Files.delete(yearDir);
-                        cleanedDirs++;
-                        log.info("Removed empty year directory: {}", yearDir);
-                    }
-                } catch (IOException ignored) {}
             }
         } catch (IOException e) {
             log.error("Error scanning memories directory for sanitization", e);
         }
 
-        SanitizationReport report = new SanitizationReport(scanned, valid, corrupted, duplicates, renamed, cleanedDirs);
+        if (allCandidates.isEmpty()) {
+            pruneDirectories(typeDirectories, yearDirectories, cleanedDirs);
+            return new SanitizationReport(0, 0, 0, 0, 0, cleanedDirs.get());
+        }
+
+        // Virtual-threaded processing across all media files
+        try (ExecutorService vExecutor = Executors.newVirtualThreadPerTaskExecutor()) {
+            // Phase 1: Parallel corruption verification
+            List<SanitizationCandidate> uncorruptedCandidates = new CopyOnWriteArrayList<>();
+            Map<Path, SanitizationCandidate> candidateByPath = new ConcurrentHashMap<>();
+            List<CompletableFuture<Void>> corruptionFutures = new ArrayList<>();
+
+            for (SanitizationCandidate candidate : allCandidates) {
+                candidateByPath.put(candidate.file(), candidate);
+                corruptionFutures.add(CompletableFuture.runAsync(() -> {
+                    if (integrityService.isCorrupted(candidate.file(), candidate.fileName())) {
+                        log.warn("Sanitizing corrupted file in memories: {}", candidate.file());
+                        integrityService.quarantineAndRemove(candidate.file(), baseMemoriesDir, candidate.year(),
+                                candidate.mediaType(), "corrupted file detected during sanitization");
+                        corruptedCount.incrementAndGet();
+                    } else {
+                        uncorruptedCandidates.add(candidate);
+                    }
+                }, vExecutor));
+            }
+            CompletableFuture.allOf(corruptionFutures.toArray(CompletableFuture[]::new)).join();
+
+            // Phase 2: Multi-tier zero-I/O duplicate detection on uncorrupted candidates
+            List<Path> uncorruptedPaths = uncorruptedCandidates.stream().map(SanitizationCandidate::file).toList();
+            DuplicateDetectionService.DeduplicationResult dedupResult =
+                    duplicateService.detectDuplicatesMultiTier(uncorruptedPaths, vExecutor);
+
+            // Quarantine duplicates in parallel using atomic filesystem moves
+            List<CompletableFuture<Void>> duplicateFutures = new ArrayList<>();
+            for (Path duplicatePath : dedupResult.duplicates()) {
+                SanitizationCandidate candidate = candidateByPath.get(duplicatePath);
+                if (candidate != null) {
+                    duplicateFutures.add(CompletableFuture.runAsync(() -> {
+                        log.info("Sanitizing duplicate file in memories: {}", duplicatePath);
+                        integrityService.quarantineAndRemove(duplicatePath, baseMemoriesDir, candidate.year(),
+                                candidate.mediaType(), "duplicate file detected during sanitization");
+                        duplicatesCount.incrementAndGet();
+                    }, vExecutor));
+                }
+            }
+            CompletableFuture.allOf(duplicateFutures.toArray(CompletableFuture[]::new)).join();
+
+            // Phase 3: Fast-path naming & renaming pass for valid files
+            List<CompletableFuture<Void>> renameFutures = new ArrayList<>();
+            for (Path validPath : dedupResult.validFiles()) {
+                SanitizationCandidate candidate = candidateByPath.get(validPath);
+                if (candidate != null) {
+                    validCount.incrementAndGet();
+                    renameFutures.add(CompletableFuture.runAsync(() -> {
+                        String fileName = candidate.fileName();
+                        Path file = candidate.file();
+                        Path typeDir = candidate.typeDir();
+
+                        // Fast-path naming check: skip if already formatted
+                        if (metadataService.isAlreadyFormatted(fileName)) {
+                            return;
+                        }
+
+                        // Unformatted file: extract metadata and rename
+                        MediaMetadataService.Metadata meta = metadataService.extractMetadata(file);
+                        String targetName = metadataService.generateTargetFileName(candidate.mediaType(), meta.captureInstant(), fileName);
+                        if (!fileName.equals(targetName)) {
+                            Path targetFile = typeDir.resolve(targetName);
+                            if (Files.exists(targetFile) && !targetFile.equals(file)) {
+                                targetFile = duplicateService.getUniqueFileName(typeDir, targetName);
+                            }
+                            try {
+                                Files.move(file, targetFile, StandardCopyOption.ATOMIC_MOVE);
+                                renamedCount.incrementAndGet();
+                                log.debug("Renamed memory file: {} -> {}", fileName, targetFile.getFileName());
+                            } catch (IOException e) {
+                                try {
+                                    Files.move(file, targetFile);
+                                    renamedCount.incrementAndGet();
+                                } catch (IOException ex) {
+                                    log.warn("Failed to rename {} to {}: {}", fileName, targetFile, ex.getMessage());
+                                }
+                            }
+                        }
+                    }, vExecutor));
+                }
+            }
+            CompletableFuture.allOf(renameFutures.toArray(CompletableFuture[]::new)).join();
+        }
+
+        // Phase 4: Directory pruning handling DirectoryNotEmptyException directly without listing streams
+        pruneDirectories(typeDirectories, yearDirectories, cleanedDirs);
+
+        SanitizationReport report = new SanitizationReport(
+                scannedCount.get(),
+                validCount.get(),
+                corruptedCount.get(),
+                duplicatesCount.get(),
+                renamedCount.get(),
+                cleanedDirs.get()
+        );
         log.info("Sanitization complete: scanned={}, valid={}, corrupted={}, duplicates={}, renamed={}, cleanedDirectories={}",
-                scanned, valid, corrupted, duplicates, renamed, cleanedDirs);
+                report.scanned(), report.valid(), report.corrupted(), report.duplicates(), report.renamed(), report.cleanedDirectories());
         return report;
     }
 
-    private boolean isDirectoryEmpty(Path directory) throws IOException {
-        try (var stream = Files.list(directory)) {
-            return !stream.findAny().isPresent();
+    private void pruneDirectories(List<Path> typeDirectories, List<Path> yearDirectories, AtomicInteger cleanedDirs) {
+        // Prune empty type directories
+        for (Path typeDir : typeDirectories) {
+            try {
+                Files.delete(typeDir);
+            } catch (DirectoryNotEmptyException | NoSuchFileException ignored) {
+            } catch (IOException e) {
+                log.debug("Unable to delete type directory {}: {}", typeDir, e.getMessage());
+            }
+        }
+
+        // Prune empty year directories
+        for (Path yearDir : yearDirectories) {
+            try {
+                Files.delete(yearDir);
+                cleanedDirs.incrementAndGet();
+                log.info("Removed empty year directory: {}", yearDir);
+            } catch (DirectoryNotEmptyException | NoSuchFileException ignored) {
+            } catch (IOException e) {
+                log.debug("Unable to delete year directory {}: {}", yearDir, e.getMessage());
+            }
         }
     }
 

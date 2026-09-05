@@ -21,6 +21,8 @@ import java.time.format.DateTimeFormatter;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @Service
 public class MediaMetadataService {
@@ -56,6 +58,7 @@ public class MediaMetadataService {
     private String photoPrefix = "IMG_";
     private String videoPrefix = "MOV_";
     private DateTimeFormatter dateFormatter = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
+    private volatile Pattern alreadyFormattedPattern = compileAlreadyFormattedPattern();
 
     public MediaMetadataService() {
     }
@@ -71,25 +74,46 @@ public class MediaMetadataService {
         if (videoPrefix != null && !videoPrefix.isBlank()) {
             this.videoPrefix = videoPrefix;
         }
+        this.alreadyFormattedPattern = compileAlreadyFormattedPattern();
+    }
+
+    private Pattern compileAlreadyFormattedPattern() {
+        String prefixes = Stream.of("IMG_", "MOV_", photoPrefix, videoPrefix)
+                .filter(p -> p != null && !p.isBlank())
+                .distinct()
+                .map(Pattern::quote)
+                .collect(Collectors.joining("|"));
+
+        return Pattern.compile(
+                "^(?:" + prefixes + ")((?:19[7-9]\\d|20[0-4]\\d))(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])_([01]\\d|2[0-3])([0-5]\\d)([0-5]\\d)(?:_\\d+)?\\.[a-zA-Z0-9]+$",
+                Pattern.CASE_INSENSITIVE
+        );
     }
 
     public void setDateFormatPattern(String dateFormatPattern) {
         if (dateFormatPattern != null && !dateFormatPattern.isBlank()) {
             this.dateFormatPattern = dateFormatPattern;
             this.dateFormatter = DateTimeFormatter.ofPattern(dateFormatPattern);
+            this.alreadyFormattedPattern = compileAlreadyFormattedPattern();
         }
     }
 
     public void setPhotoPrefix(String photoPrefix) {
         if (photoPrefix != null && !photoPrefix.isBlank()) {
             this.photoPrefix = photoPrefix;
+            this.alreadyFormattedPattern = compileAlreadyFormattedPattern();
         }
     }
 
     public void setVideoPrefix(String videoPrefix) {
         if (videoPrefix != null && !videoPrefix.isBlank()) {
             this.videoPrefix = videoPrefix;
+            this.alreadyFormattedPattern = compileAlreadyFormattedPattern();
         }
+    }
+
+    public Pattern getAlreadyFormattedPattern() {
+        return alreadyFormattedPattern;
     }
 
     public String getDateFormatPattern() {
@@ -133,12 +157,47 @@ public class MediaMetadataService {
         return ext != null && ARCHIVE_EXTENSIONS.contains(ext);
     }
 
+    public boolean isAlreadyFormatted(String fileName) {
+        if (fileName == null || fileName.isBlank()) {
+            return false;
+        }
+        return alreadyFormattedPattern.matcher(fileName).matches();
+    }
+
+    public Metadata extractFastPathMetadata(String fileName) {
+        if (fileName == null) return null;
+        Matcher matcher = alreadyFormattedPattern.matcher(fileName);
+        if (matcher.matches()) {
+            try {
+                int year = Integer.parseInt(matcher.group(1));
+                int month = Integer.parseInt(matcher.group(2));
+                int day = Integer.parseInt(matcher.group(3));
+                int hour = Integer.parseInt(matcher.group(4));
+                int min = Integer.parseInt(matcher.group(5));
+                int sec = Integer.parseInt(matcher.group(6));
+                LocalDateTime ldt = LocalDateTime.of(year, month, day, hour, min, sec);
+                Instant instant = ldt.atZone(ZoneId.systemDefault()).toInstant();
+                return new Metadata(year, instant, "filename-regex");
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
     public boolean isSupportedMedia(String fileName) {
         return isPhoto(fileName) || isVideo(fileName) || isArchiveFile(fileName);
     }
 
     public Metadata extractMetadata(Path file) {
         String fileName = file.getFileName().toString();
+
+        // Fast-path: Check if file is already formatted to skip redundant EXIF/container parsing
+        if (isAlreadyFormatted(fileName)) {
+            Metadata fastPathMeta = extractFastPathMetadata(fileName);
+            if (fastPathMeta != null) {
+                return fastPathMeta;
+            }
+        }
 
         // 1. Photo EXIF metadata
         if (isPhoto(fileName)) {
