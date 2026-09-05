@@ -55,6 +55,7 @@ public class MediaExtractorService {
     private volatile ExtractionReport lastReport;
     private boolean quarantineEnabled = true;
     private boolean preserveTimestamps = true;
+    private final CopyOnWriteArrayList<Path> extractedImagePaths = new CopyOnWriteArrayList<>();
 
     public MediaExtractorService() {
         this(new MediaMetadataService());
@@ -105,8 +106,13 @@ public class MediaExtractorService {
 
     public ExtractionReport startReport() {
         duplicateService.clear();
+        extractedImagePaths.clear();
         lastReport = new ExtractionReport();
         return lastReport;
+    }
+
+    public List<Path> getExtractedImagePaths() {
+        return List.copyOf(extractedImagePaths);
     }
 
     public void cleanupTempDir() {
@@ -286,6 +292,9 @@ public class MediaExtractorService {
 
                     log.info("Copied media file to: {}", targetFile);
                     report.extracted(type, year, size);
+                    if ("photo".equals(type)) {
+                        extractedImagePaths.add(targetFile.toAbsolutePath().normalize());
+                    }
                     return;
                 } catch (java.nio.file.FileAlreadyExistsException e) {
                     targetFile = duplicateService.getUniqueFileName(targetDir, fileName);
@@ -440,6 +449,9 @@ public class MediaExtractorService {
 
                     log.info("Extracted media file to: {}", targetFile);
                     report.extracted(type, year, size);
+                    if ("photo".equals(type)) {
+                        extractedImagePaths.add(targetFile.toAbsolutePath().normalize());
+                    }
                     return;
                 } catch (java.nio.file.FileAlreadyExistsException e) {
                     targetFile = duplicateService.getUniqueFileName(targetDir, fileName);

@@ -24,11 +24,14 @@ public class MediaExtractorApplication implements CommandLineRunner {
 
     private final MediaExtractorService mediaExtractorService;
     private final Environment environment;
+    private final PythonClassifierProcessService classifierProcessService;
 
     public MediaExtractorApplication(MediaExtractorService mediaExtractorService,
-                                     Environment environment) {
+                                     Environment environment,
+                                     PythonClassifierProcessService classifierProcessService) {
         this.mediaExtractorService = mediaExtractorService;
         this.environment = environment;
+        this.classifierProcessService = classifierProcessService;
     }
 
     static void main(String[] args) {
@@ -129,6 +132,11 @@ public class MediaExtractorApplication implements CommandLineRunner {
             log.info("Cleaning up temporary extraction files");
             mediaExtractorService.cleanupTempDir();
         }
+
+        classifierProcessService.classifyAfterExtraction(
+            baseMemoriesDir,
+            mediaExtractorService.getExtractedImagePaths(),
+            environment);
 
         log.info("Media extraction workflow completed");
     }

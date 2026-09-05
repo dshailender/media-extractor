@@ -114,3 +114,70 @@ On Windows:
 ```bash
 java -jar target/media-extractor-0.0.1-SNAPSHOT.jar C:\Users\YourName\Pictures
 ```
+
+### Meme & Greeting Classification (AI Sidecar)
+
+To segregate memes and greetings from extracted personal photos into `~/memories/{YYYY}/memes/` and `~/memories/{YYYY}/greetings/`:
+
+```bash
+# 1. Setup Python virtual environment (one-time setup)
+./scripts/setup_env.sh
+
+# 2. Dry-run inspection (audits without moving files)
+.venv/bin/python scripts/classify_memes.py --source-dir ~/memories/ --action dry-run
+
+# 3. Move memes & greetings to dedicated memory folders
+.venv/bin/python scripts/classify_memes.py --source-dir ~/memories/ --action move
+
+# Optional: Enable Gemini 2.5 Flash Free-Tier Fallback for low-confidence files (< 0.65)
+export GEMINI_API_KEY="your_api_key_here"
+.venv/bin/python scripts/classify_memes.py --source-dir ~/memories/ --action move --rate-limit-rpm 12.0
+```
+
+**Features:**
+- **Tier 1 (Instant EXIF Hardware Prior)**: Real camera photos with `Make`/`Model` tags bypass AI models at 0ms.
+- **Tier 2 (EasyOCR Multilingual Text Extraction)**: Fast CPU-optimized OCR using multi-variant contrast preprocessing, extracting bounding boxes, text area ratio, and multilingual keyword hits (English, Hindi, festival wishes, quotes, meme catchphrases, document terms).
+- **Tier 3 (Local CLIP Zero-Shot Prompt Ensemble)**: Fuses multi-prompt text-image similarity with balanced category aggregation, margin, and normalized entropy on CPU.
+- **Tier 4 (Hierarchical Decision Engine & Uncertainty Scoring)**: Fuses EXIF, OCR text, aspect ratios, caption layouts, and CLIP scores with calibrated uncertainty $U \in [0, 1]$.
+- **Tier 5 (Structured Multimodal Gemini Fallback)**: Rate-limited free-tier fallback (12 RPM) for ambiguous images, passing OCR text and signals for strict JSON classification.
+- **Review Mode**: Flags uncertain files ($U \ge 0.40$) to `review_queue.csv` and suppresses file movements to guarantee zero data loss.
+- **Ground-Truth Evaluator**: Built-in CLI evaluation (`--evaluate <labeled.csv>`) computing full confusion matrices, per-class Precision/Recall/F1, and overall accuracy.
+- **Deduplication & Resume**: Writes real-time audit records to 17-column `classification_results.csv` and skips already processed files on restart.
+
+### Advanced CLI Options:
+
+```bash
+# Evaluate classifier against ground-truth labeled dataset
+.venv/bin/python scripts/classify_memes.py --evaluate test_benchmark_2017.csv --no-gemini
+
+# Run with custom OCR languages (e.g. English + Hindi)
+.venv/bin/python scripts/classify_memes.py --source-dir ~/memories/ --ocr-languages en hi
+
+# Review mode with custom uncertainty threshold
+.venv/bin/python scripts/classify_memes.py --source-dir ~/memories/ --action move --review-threshold 0.35 --review-csv review_queue.csv
+
+# Rescue valid personal photos mistakenly quarantined in previous runs
+.venv/bin/python scripts/classify_memes.py --source-dir ~/memories/quarantine/2017 --action move --rescue
+```
+
+To invoke the Python classifier automatically after a normal Java extraction run, enable it in
+`src/main/resources/application.properties` or with Spring command-line properties:
+
+```properties
+media-extractor.classifier-enabled=true
+media-extractor.classifier-working-directory=/home/user/projects/media-extractor
+media-extractor.classifier-python=.venv/bin/python
+media-extractor.classifier-script=scripts/classify_memes.py
+media-extractor.classifier-action=dry-run
+```
+
+The default action is `dry-run`; use `copy` or `move` only when automatic relocation is intended.
+Java writes a temporary manifest containing only photo files successfully produced by the current
+extraction run, including photos found inside archives, and passes it with `--input-manifest`.
+Existing files elsewhere under `~/memories` are not classified by this automatic hook. The Python
+script can still be run directly with `--source-dir` for a full-tree scan.
+
+Automatic classification is skipped for `--sanitize`/`--clean`, the `test` profile, and runs that
+extract no photos. Python startup failures, nonzero exit codes, and timeouts are logged while the
+completed Java extraction remains successful.
+
