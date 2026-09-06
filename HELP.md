@@ -167,11 +167,13 @@ export GEMINI_API_KEY="your_api_key_here"
 .venv/bin/python scripts/classify_memes.py --source-dir ~/memories/quarantine/2017 --action move --rescue
 ```
 
-The Python classifier is enabled by default to run automatically after extraction.
+The Python classifier is enabled by default to run automatically after extraction with Java-assisted triage.
 Its behavior is configured in `src/main/resources/application.properties` or overridden via CLI flags:
 
 ```properties
 media-extractor.classifier-enabled=true
+media-extractor.classifier-mode=java-triage-python
+media-extractor.classifier-max-concurrency=256
 media-extractor.classifier-action=move
 media-extractor.classifier-quarantine=true
 media-extractor.classifier-python=.venv/bin/python
@@ -179,11 +181,19 @@ media-extractor.classifier-script=scripts/classify_memes.py
 media-extractor.classifier-working-directory=.
 ```
 
+**Classifier Modes:**
+- `java-triage-python` (Default): Uses high-speed Java virtual threads to inspect image headers and certify unambiguous camera photos (< 0.5ms/image). Obvious photos stay in `~/memories/{YYYY}/photos/` and bypass Python models completely. Candidates (screenshots, memes, non-camera images) are staged to `~/memories/.staging-{runId}/` and passed to Python via an enriched JSON Lines manifest. Guaranteed rollback restores any stranded files if interrupted.
+- `python`: Legacy execution passing all extracted images directly to Python via manifest without Java triage.
+- `java-only`: Experimental mode performing only Java-level camera triage without spawning the Python process.
+- `disabled`: Skips classification entirely.
+
+**CLI Overrides:**
+- `--mode=java-triage-python`, `--mode=python`, `--mode=disabled`
+- `--classify`, `--no-classify`
+- `--move`, `--copy`, `--dry-run`
+- `--quarantine`, `--no-quarantine`
+
 - By default, action is `move` and quarantine is `true`, routing memes and greetings directly into `~/memories/quarantine/{YYYY}/`.
 - Use `--dry-run` to inspect without moving, or `--no-classify` to disable the classifier.
-- Java writes a temporary manifest containing only photo files successfully extracted by the current run, including photos from nested archives, and passes it via `--input-manifest`. Existing files elsewhere under `~/memories/` are not touched. The Python script can still be run standalone directly with `--source-dir` for a full directory scan.
-
-Automatic classification is skipped for `--sanitize`/`--clean`, the `test` profile, and runs that
-extract no photos. Python startup failures, nonzero exit codes, and timeouts are logged while the
-completed Java extraction remains successful.
+- Automatic classification is skipped for `--sanitize`/`--clean`, the `test` profile, and runs that extract no photos. Python startup failures, nonzero exit codes, and timeouts are logged while the completed Java extraction remains successful. Staged files are automatically restored on failure.
 

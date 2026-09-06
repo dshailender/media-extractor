@@ -136,10 +136,16 @@ public class MediaExtractorApplication implements CommandLineRunner {
         Boolean classifierEnabledOverride = null;
         String classifierActionOverride = null;
         Boolean classifierQuarantineOverride = null;
+        String classifierModeOverride = null;
 
-        for (String arg : args) {
+        for (int i = 0; i < args.length; i++) {
+            String arg = args[i];
             String lower = arg.toLowerCase();
-            if (lower.equals("--classify")) {
+            if (lower.startsWith("--mode=")) {
+                classifierModeOverride = arg.substring("--mode=".length()).trim();
+            } else if (lower.equals("--mode") && i + 1 < args.length) {
+                classifierModeOverride = args[++i].trim();
+            } else if (lower.equals("--classify")) {
                 classifierEnabledOverride = true;
             } else if (lower.equals("--no-classify")) {
                 classifierEnabledOverride = false;
@@ -166,7 +172,8 @@ public class MediaExtractorApplication implements CommandLineRunner {
             new PythonClassifierProcessService.ClassifierOptions(
                 classifierEnabledOverride,
                 classifierActionOverride,
-                classifierQuarantineOverride
+                classifierQuarantineOverride,
+                classifierModeOverride
             ));
 
         log.info("Media extraction workflow completed");

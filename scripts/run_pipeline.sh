@@ -30,6 +30,7 @@ if [ -z "${SOURCE_DIR}" ]; then
     echo "Usage: $0 <source_directory> [options]"
     echo ""
     echo "Options:"
+    echo "  --mode=<mode>     Classifier mode: java-triage-python (default), python, java-only, disabled"
     echo "  --dry-run         Run classifier in audit mode without moving memes/greetings"
     echo "  --no-classify     Skip Python classification entirely"
     echo "  --no-quarantine   Move memes/greetings to ~/memories/{YYYY}/ instead of quarantine"
@@ -37,6 +38,8 @@ if [ -z "${SOURCE_DIR}" ]; then
     echo "Example:"
     echo "  $0 /path/to/backup"
     echo "  $0 /path/to/backup --dry-run"
+    echo "  $0 /path/to/backup --mode=java-triage-python"
+    echo "  $0 /path/to/backup --mode=python"
     exit 1
 fi
 
@@ -45,6 +48,7 @@ shift
 echo "=========================================================="
 echo "Media Extractor: Unified Extraction & Classification"
 echo "Source:          ${SOURCE_DIR}"
+echo "Mode:            java-triage-python (default)"
 echo "Action:          move (default)"
 echo "Quarantine:      ~/memories/quarantine/{YYYY}/ (default)"
 echo "=========================================================="

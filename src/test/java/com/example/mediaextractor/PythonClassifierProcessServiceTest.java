@@ -6,6 +6,7 @@ import org.springframework.mock.env.MockEnvironment;
 import java.nio.file.Path;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -65,6 +66,30 @@ class PythonClassifierProcessServiceTest {
         assertTrue(command.contains("output.csv"));
         assertTrue(command.contains("--review-csv"));
         assertTrue(command.contains("review.csv"));
+    }
+
+    @Test
+    void testClassifierOptionsDefaultsAndOverrides() {
+        PythonClassifierProcessService.ClassifierOptions defaults = PythonClassifierProcessService.ClassifierOptions.defaults();
+        assertFalse(Boolean.TRUE.equals(defaults.enabledOverride()));
+        assertFalse("move".equals(defaults.actionOverride()));
+
+        PythonClassifierProcessService.ClassifierOptions custom = new PythonClassifierProcessService.ClassifierOptions(
+                true, "dry-run", false, "java-triage-python"
+        );
+        assertTrue(custom.enabledOverride());
+        assertEquals("dry-run", custom.actionOverride());
+        assertFalse(custom.quarantineOverride());
+        assertEquals("java-triage-python", custom.modeOverride());
+    }
+
+    @Test
+    void testClassifyAfterExtractionWhenDisabledDoesNotThrow() {
+        PythonClassifierProcessService service = new PythonClassifierProcessService();
+        MockEnvironment env = new MockEnvironment();
+        env.setProperty("media-extractor.classifier-enabled", "false");
+
+        service.classifyAfterExtraction(Path.of("/tmp/memories"), List.of(Path.of("/tmp/photo.jpg")), env);
     }
 }
 

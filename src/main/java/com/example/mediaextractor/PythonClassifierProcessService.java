@@ -23,13 +23,28 @@ public class PythonClassifierProcessService {
     private static final Logger log = LoggerFactory.getLogger(PythonClassifierProcessService.class);
     private static final long DEFAULT_TIMEOUT_MINUTES = 1_440L;
 
+    private final JavaClassifierTriageService triageService;
+
+    public PythonClassifierProcessService() {
+        this(new JavaClassifierTriageService(new MediaMetadataService()));
+    }
+
+    public PythonClassifierProcessService(JavaClassifierTriageService triageService) {
+        this.triageService = triageService;
+    }
+
     public record ClassifierOptions(
         Boolean enabledOverride,
         String actionOverride,
-        Boolean quarantineOverride
+        Boolean quarantineOverride,
+        String modeOverride
     ) {
         public static ClassifierOptions defaults() {
-            return new ClassifierOptions(null, null, null);
+            return new ClassifierOptions(null, null, null, null);
+        }
+
+        public ClassifierOptions(Boolean enabledOverride, String actionOverride, Boolean quarantineOverride) {
+            this(enabledOverride, actionOverride, quarantineOverride, null);
         }
     }
 
@@ -44,8 +59,27 @@ public class PythonClassifierProcessService {
         if (!enabled) {
             return;
         }
+
+        String mode = options != null && options.modeOverride() != null
+                ? options.modeOverride().toLowerCase()
+                : environment.getProperty("media-extractor.classifier-mode", "java-triage-python").toLowerCase();
+
+        if ("disabled".equals(mode) || "false".equals(mode) || "off".equals(mode)) {
+            log.info("Media Extractor classifier is disabled (mode={})", mode);
+            return;
+        }
+
         if (imagePaths.isEmpty()) {
-            log.info("Python classifier enabled, but no images were extracted in this run");
+            log.info("Media Extractor classifier enabled, but no images were extracted in this run");
+            return;
+        }
+
+        if ("java-only".equals(mode)) {
+            log.info("Classifier running in experimental java-only triage mode (no Python execution)");
+            int maxConcurrency = environment.getProperty("media-extractor.classifier-max-concurrency", Integer.class, 256);
+            JavaClassifierTriageService.TriageSummary summary = triageService.triageAndStage(imagePaths, memoriesDir, "dry-run", maxConcurrency);
+            log.info("Java-only triage complete: {} certified photos, {} deferred candidates",
+                    summary.certifiedPhotos(), summary.stagedForPython());
             return;
         }
 
@@ -64,8 +98,91 @@ public class PythonClassifierProcessService {
                 ? options.quarantineOverride()
                 : environment.getProperty("media-extractor.classifier-quarantine", Boolean.class, true);
 
+        boolean useJavaTriage = "java-triage-python".equals(mode);
+
+        if (useJavaTriage) {
+            executeWithJavaTriage(memoriesDir, imagePaths, environment, workingDirectory, python, script, action, quarantine);
+        } else {
+            executeDirectPython(memoriesDir, imagePaths, environment, workingDirectory, python, script, action, quarantine);
+        }
+    }
+
+    private void executeWithJavaTriage(
+            Path memoriesDir,
+            List<Path> imagePaths,
+            Environment environment,
+            Path workingDirectory,
+            Path python,
+            Path script,
+            String action,
+            boolean quarantine) {
+        int maxConcurrency = environment.getProperty("media-extractor.classifier-max-concurrency", Integer.class, 256);
+        JavaClassifierTriageService.TriageSummary triageSummary = null;
+        Process process = null;
+        try {
+            triageSummary = triageService.triageAndStage(imagePaths, memoriesDir, action, maxConcurrency);
+            if (triageSummary.stagedForPython() == 0) {
+                log.info("All {} extracted images were certified as camera photos in Java triage; bypassing Python classifier entirely!",
+                        imagePaths.size());
+                return;
+            }
+
+            log.info("Java triage staged {} candidates for Python evaluation ({} certified photos retained in memories)",
+                    triageSummary.stagedForPython(), triageSummary.certifiedPhotos());
+
+            Path manifest = triageSummary.manifestPath();
+            List<String> command = buildCommand(python, script, memoriesDir, manifest, action, quarantine, environment);
+
+            log.info("Starting Python classifier for {} staged images using {}", triageSummary.stagedForPython(), script);
+            Process startedProcess = new ProcessBuilder(command)
+                    .directory(workingDirectory.toFile())
+                    .redirectErrorStream(true)
+                    .start();
+            process = startedProcess;
+
+            CompletableFuture<Void> outputDrainer = CompletableFuture.runAsync(() -> drainOutput(startedProcess));
+
+            long timeoutMinutes = environment.getProperty("media-extractor.classifier-timeout-minutes", Long.class,
+                    DEFAULT_TIMEOUT_MINUTES);
+            if (!startedProcess.waitFor(Duration.ofMinutes(timeoutMinutes).toMillis(), TimeUnit.MILLISECONDS)) {
+                startedProcess.destroyForcibly();
+                log.error("Python classifier timed out after {} minutes", timeoutMinutes);
+            } else if (startedProcess.exitValue() == 0) {
+                log.info("Python classifier completed successfully");
+            } else {
+                log.error("Python classifier exited with status {}", startedProcess.exitValue());
+            }
+            outputDrainer.join();
+        } catch (IOException e) {
+            log.error("Could not run classification workflow: {}", e.getMessage(), e);
+        } catch (InterruptedException e) {
+            if (process != null) {
+                process.destroyForcibly();
+            }
+            Thread.currentThread().interrupt();
+            log.error("Interrupted while waiting for Python classifier");
+        } finally {
+            if (triageSummary != null) {
+                int restored = triageService.restoreStrandedFiles(triageSummary);
+                if (restored > 0) {
+                    log.warn("Safety restored {} unclassified files from staging back to memories photos directory", restored);
+                }
+                triageService.cleanupStagingDir(triageSummary);
+            }
+        }
+    }
+
+    private void executeDirectPython(
+            Path memoriesDir,
+            List<Path> imagePaths,
+            Environment environment,
+            Path workingDirectory,
+            Path python,
+            Path script,
+            String action,
+            boolean quarantine) {
         Path manifest = null;
-    Process process = null;
+        Process process = null;
         try {
             manifest = Files.createTempFile("media-extractor-classifier-", ".manifest");
             Files.write(manifest, imagePaths.stream().map(path -> path.toAbsolutePath().normalize().toString()).toList(),
@@ -74,13 +191,13 @@ public class PythonClassifierProcessService {
             List<String> command = buildCommand(python, script, memoriesDir, manifest, action, quarantine, environment);
 
             log.info("Starting Python classifier for {} extracted images using {}", imagePaths.size(), script);
-                Process startedProcess = new ProcessBuilder(command)
+            Process startedProcess = new ProcessBuilder(command)
                     .directory(workingDirectory.toFile())
                     .redirectErrorStream(true)
                     .start();
-                process = startedProcess;
+            process = startedProcess;
 
-                CompletableFuture<Void> outputDrainer = CompletableFuture.runAsync(() -> drainOutput(startedProcess));
+            CompletableFuture<Void> outputDrainer = CompletableFuture.runAsync(() -> drainOutput(startedProcess));
 
             long timeoutMinutes = environment.getProperty("media-extractor.classifier-timeout-minutes", Long.class,
                     DEFAULT_TIMEOUT_MINUTES);

@@ -44,6 +44,7 @@ from classify_memes import (
     GeminiFallbackClassifier,
     HierarchicalDecisionEngine,
     ImagePreprocessor,
+    LocalClipEnsembleClassifier,
     SignalExtractor,
     TokenBucketRateLimiter,
     extract_year_and_memories_root,
@@ -372,6 +373,96 @@ class TestClassifier(unittest.TestCase):
         self.assertEqual(decision_l["category"], "PHOTO")
         self.assertFalse(decision_l["needs_review"])
 
+    def test_load_rgb_image_downscaling(self):
+        # Create an oversized image (3000x2000)
+        large_path = self.test_dir / "large_photo.jpg"
+        img_large = Image.new("RGB", (3000, 2000), color="blue")
+        img_large.save(large_path, "JPEG")
+
+        loaded = ImagePreprocessor.load_rgb_image(large_path, max_dim=1200)
+        self.assertEqual(loaded.mode, "RGB")
+        self.assertLessEqual(max(loaded.size), 1200)
+        self.assertEqual(loaded.size, (1200, 800))
+
+    def test_clip_ensemble_classifier(self):
+        clip = LocalClipEnsembleClassifier(device="cpu")
+        sample_img = Image.new("RGB", (224, 224), color="green")
+        results = clip.classify_batch([sample_img])
+        self.assertEqual(len(results), 1)
+        res = results[0]
+        self.assertIn("top_label", res)
+        self.assertIn(res["top_label"], {"PHOTO", "MEME", "GREETING"})
+        self.assertIn("confidence", res)
+        self.assertIn("margin", res)
+        self.assertIn("scores", res)
+        self.assertAlmostEqual(sum(res["scores"].values()), 1.0, places=4)
+
+
+    def test_staged_file_routing(self):
+        memories_root = self.test_dir / "memories"
+        staging_dir = memories_root / ".staging-test-123"
+        staging_dir.mkdir(parents=True)
+        photos_2024 = memories_root / "2024" / "photos"
+        photos_2024.mkdir(parents=True)
+
+        orig_photo = photos_2024 / "my_pic.jpg"
+        staged_photo = staging_dir / "uuid_my_pic.jpg"
+        staged_photo.write_text("photo_data")
+
+        staged_info_photo = {
+            "original_path": orig_photo,
+            "original_year": 2024,
+            "triage_category": "NEEDS_PYTHON",
+            "triage_reason": "Missing Camera EXIF",
+        }
+
+        # 1. Staged file classified as PHOTO -> returned to original photos folder
+        res_photo = route_file(
+            staged_photo, "PHOTO", "move", memories_root,
+            quarantine=True, staged_info=staged_info_photo
+        )
+        self.assertIsNotNone(res_photo)
+        self.assertEqual(res_photo, orig_photo)
+        self.assertTrue(orig_photo.exists())
+        self.assertFalse(staged_photo.exists())
+
+        # 2. Staged file classified as MEME -> moved to quarantine memes folder
+        staged_meme = staging_dir / "uuid_meme.png"
+        staged_meme.write_text("meme_data")
+        orig_meme = photos_2024 / "downloaded_meme.png"
+        staged_info_meme = {
+            "original_path": orig_meme,
+            "original_year": 2024,
+            "triage_category": "NEEDS_PYTHON",
+            "triage_reason": "Non-camera container format: png",
+        }
+        res_meme = route_file(
+            staged_meme, "MEME", "move", memories_root,
+            quarantine=True, staged_info=staged_info_meme
+        )
+        expected_meme_dest = memories_root / "quarantine" / "2024" / "memes" / "downloaded_meme.png"
+        self.assertIsNotNone(res_meme)
+        self.assertEqual(res_meme, expected_meme_dest)
+        self.assertTrue(expected_meme_dest.exists())
+        self.assertFalse(staged_meme.exists())
+
+        # 3. Dry-run with staged file -> returns destination without moving
+        staged_dry = staging_dir / "uuid_dry.jpg"
+        staged_dry.write_text("dry_data")
+        orig_dry = photos_2024 / "dry_run_photo.jpg"
+        staged_info_dry = {
+            "original_path": orig_dry,
+            "original_year": 2024,
+        }
+        res_dry = route_file(
+            staged_dry, "PHOTO", "dry-run", memories_root,
+            quarantine=True, staged_info=staged_info_dry
+        )
+        self.assertEqual(res_dry, orig_dry)
+        self.assertTrue(staged_dry.exists())
+        self.assertFalse(orig_dry.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
+

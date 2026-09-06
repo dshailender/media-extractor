@@ -27,14 +27,22 @@ import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image, ImageOps, ImageFilter, ExifTags
 from tqdm import tqdm
 
-MODEL_VERSION = "2.0.0-hierarchical-ocr-clip"
+import torch
+
+# Optimize PyTorch CPU threading for physical cores on Zen 3+ (Ryzen 5 6600H)
+try:
+    torch.set_num_threads(min(6, os.cpu_count() or 6))
+except Exception:
+    pass
+
+MODEL_VERSION = "2.1.0-fast-hierarchical-ocr-clip"
 
 # Camera EXIF tag identifiers
 CAMERA_MAKE_TAG = 0x010F   # 'Make'
@@ -132,10 +140,35 @@ class ImagePreprocessor:
             return bg
         return pil_image.convert("RGB")
 
-    @classmethod
-    def generate_ocr_variants(cls, pil_rgb: Image.Image) -> List[Tuple[str, np.ndarray]]:
+    @staticmethod
+    def load_rgb_image(image_path: Path, max_dim: int = 1600) -> Image.Image:
         """
-        Generates preprocessing variants for OCR:
+        Loads an image file, applies EXIF orientation transpose, converts to RGB,
+        and bounds maximum dimension to max_dim to avoid excessive CPU/memory load.
+        """
+        with Image.open(image_path) as raw_img:
+            w, h = raw_img.size
+            largest = max(w, h)
+            if largest > max_dim:
+                scale = max_dim / float(largest)
+                target_size = (int(w * scale), int(h * scale))
+                try:
+                    raw_img.draft("RGB", target_size)
+                except Exception:
+                    pass
+            oriented = ImagePreprocessor.correct_orientation(raw_img)
+            rgb = ImagePreprocessor.safe_convert_rgb(oriented)
+            if max(rgb.size) > max_dim:
+                scale = max_dim / float(max(rgb.size))
+                new_w = max(1, int(rgb.size[0] * scale))
+                new_h = max(1, int(rgb.size[1] * scale))
+                rgb = rgb.resize((new_w, new_h), Image.Resampling.BILINEAR)
+            return rgb
+
+    @classmethod
+    def generate_ocr_variants(cls, pil_rgb: Image.Image) -> Generator[Tuple[str, np.ndarray], None, None]:
+        """
+        Generates preprocessing variants for OCR on demand:
         - original: standard RGB to BGR
         - enlarged: bicubic upscaling if resolution is low
         - high_contrast_gray: CLAHE contrast normalization
@@ -143,7 +176,7 @@ class ImagePreprocessor:
         - sharpened: unsharp convolution filter
         """
         bgr = cv2.cvtColor(np.array(pil_rgb), cv2.COLOR_RGB2BGR)
-        variants = [("original", bgr)]
+        yield ("original", bgr)
 
         h, w = bgr.shape[:2]
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -153,20 +186,20 @@ class ImagePreprocessor:
             scale = min(2.0, 800.0 / max(min(h, w), 1))
             new_w, new_h = int(w * scale), int(h * scale)
             enlarged = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-            variants.append(("enlarged", enlarged))
+            yield ("enlarged", enlarged)
 
         # 2. High contrast grayscale (CLAHE)
         try:
             clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
             contrast_gray = clahe.apply(gray)
-            variants.append(("high_contrast_gray", cv2.cvtColor(contrast_gray, cv2.COLOR_GRAY2BGR)))
+            yield ("high_contrast_gray", cv2.cvtColor(contrast_gray, cv2.COLOR_GRAY2BGR))
         except Exception:
             pass
 
         # 3. Adaptive thresholding
         try:
             adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4)
-            variants.append(("adaptive_thresh", cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR)))
+            yield ("adaptive_thresh", cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR))
         except Exception:
             pass
 
@@ -174,11 +207,9 @@ class ImagePreprocessor:
         try:
             kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
             sharpened = cv2.filter2D(bgr, -1, kernel)
-            variants.append(("sharpened", sharpened))
+            yield ("sharpened", sharpened)
         except Exception:
             pass
-
-        return variants
 
 
 class EasyOcrEngine:
@@ -224,8 +255,11 @@ class EasyOcrEngine:
         except Exception:
             cache_key = None
 
-        norm_image = ImagePreprocessor.correct_orientation(pil_image)
-        norm_rgb = ImagePreprocessor.safe_convert_rgb(norm_image)
+        if pil_image.mode == "RGB":
+            norm_rgb = pil_image
+        else:
+            norm_image = ImagePreprocessor.correct_orientation(pil_image)
+            norm_rgb = ImagePreprocessor.safe_convert_rgb(norm_image)
         orig_w, orig_h = norm_rgb.size
         img_area = float(max(orig_w * orig_h, 1))
 
@@ -245,11 +279,16 @@ class EasyOcrEngine:
             print(f"[WARN] EasyOCR initialization failed: {e}")
             return default_result
 
-        # Scale down for OCR if image is very large (e.g. 12MP camera photo) to keep CPU performance high
+        # Camera photos do not require multi-variant enhancement sweeps
+        if has_camera_exif:
+            run_variants = False
+
+        # Scale down for OCR if image is large: 800px max dimension provides 2.5x faster
+        # CRAFT text detection while capturing all meme captions, greetings, and screenshots.
         ocr_scale = 1.0
         max_dim = max(orig_w, orig_h)
-        if max_dim > 1280:
-            ocr_scale = 1280.0 / max_dim
+        if max_dim > 800:
+            ocr_scale = 800.0 / max_dim
             norm_rgb_for_ocr = norm_rgb.resize((int(orig_w * ocr_scale), int(orig_h * ocr_scale)), Image.Resampling.BILINEAR)
         else:
             norm_rgb_for_ocr = norm_rgb
@@ -258,43 +297,44 @@ class EasyOcrEngine:
         all_detections: List[Tuple[List, str, float]] = []
         seen_texts: Set[str] = set()
 
-        for var_idx, (var_name, var_bgr) in enumerate(variants):
-            if var_idx > 0 and not run_variants:
-                break
-
-            try:
-                raw_results = self._reader.readtext(var_bgr, detail=1, paragraph=False)
-                for bbox, text, conf in raw_results:
-                    clean_str = text.strip()
-                    if not clean_str or len(clean_str) < 2 or conf < 0.20:
-                        continue
-
-                    norm_key = re.sub(r"\W+", "", clean_str).lower()
-                    if norm_key in seen_texts:
-                        continue
-                    seen_texts.add(norm_key)
-
-                    # Scale bbox back to original image dimensions if downscaled
-                    if ocr_scale != 1.0:
-                        scaled_bbox = [[pt[0] / ocr_scale, pt[1] / ocr_scale] for pt in bbox]
-                    else:
-                        scaled_bbox = bbox
-
-                    all_detections.append((scaled_bbox, clean_str, float(conf)))
-
-                # Smart short-circuit:
-                # A. Zero text detected on original: skip remaining variants (avoid excessive preprocessing on natural photos)
-                if var_idx == 0 and len(all_detections) == 0:
+        with torch.inference_mode():
+            for var_idx, (var_name, var_bgr) in enumerate(variants):
+                if var_idx > 0 and not run_variants:
                     break
 
-                # B. Any image with clear confident text: skip remaining variants
-                if var_idx == 0:
-                    joined = " ".join(t for _, t, _ in all_detections)
-                    avg_c = np.mean([c for _, _, c in all_detections]) if all_detections else 0.0
-                    if len(joined) >= 15 and avg_c >= 0.60:
+                try:
+                    raw_results = self._reader.readtext(var_bgr, detail=1, paragraph=False)
+                    for bbox, text, conf in raw_results:
+                        clean_str = text.strip()
+                        if not clean_str or len(clean_str) < 2 or conf < 0.20:
+                            continue
+
+                        norm_key = re.sub(r"\W+", "", clean_str).lower()
+                        if norm_key in seen_texts:
+                            continue
+                        seen_texts.add(norm_key)
+
+                        # Scale bbox back to original image dimensions if downscaled
+                        if ocr_scale != 1.0:
+                            scaled_bbox = [[pt[0] / ocr_scale, pt[1] / ocr_scale] for pt in bbox]
+                        else:
+                            scaled_bbox = bbox
+
+                        all_detections.append((scaled_bbox, clean_str, float(conf)))
+
+                    # Smart short-circuit:
+                    # A. Zero text detected on original: skip remaining variants (avoid excessive preprocessing on natural photos)
+                    if var_idx == 0 and len(all_detections) == 0:
                         break
-            except Exception as e:
-                pass
+
+                    # B. Any image with clear confident text: skip remaining variants
+                    if var_idx == 0:
+                        joined = " ".join(t for _, t, _ in all_detections)
+                        avg_c = np.mean([c for _, _, c in all_detections]) if all_detections else 0.0
+                        if len(joined) >= 15 and avg_c >= 0.60:
+                            break
+                except Exception as e:
+                    pass
 
         if not all_detections:
             if cache_key:
@@ -453,7 +493,9 @@ class LocalClipEnsembleClassifier:
     """Local multi-class Zero-Shot Vision Classifier using prompt ensembling on CLIP."""
     def __init__(self, device: str = "cpu"):
         self.device = device
-        self._pipeline = None
+        self._model = None
+        self._processor = None
+        self._text_weights = None
 
         # Diverse multi-prompt ensembles per category
         self.category_prompts = {
@@ -481,30 +523,40 @@ class LocalClipEnsembleClassifier:
                 self.prompt_to_category[p] = cat
 
     def _load_model(self):
-        if self._pipeline is None:
+        if self._model is None:
             print("[INFO] Initializing local CLIP model (openai/clip-vit-base-patch32)...")
             os.environ.setdefault("HF_HUB_OFFLINE", "1")
             os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-            from transformers import pipeline
+            from transformers import CLIPModel, CLIPProcessor
             try:
-                self._pipeline = pipeline(
-                    "zero-shot-image-classification",
-                    model="openai/clip-vit-base-patch32",
-                    device=self.device,
-                )
+                self._model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+                self._processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
             except Exception:
                 os.environ.pop("HF_HUB_OFFLINE", None)
                 os.environ.pop("TRANSFORMERS_OFFLINE", None)
-                self._pipeline = pipeline(
-                    "zero-shot-image-classification",
-                    model="openai/clip-vit-base-patch32",
-                    device=self.device,
-                )
-            print("[INFO] CLIP model ready.")
+                self._model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+                self._processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            self._model.eval()
+            if self.device != "cpu":
+                try:
+                    self._model.to(self.device)
+                except Exception:
+                    self.device = "cpu"
+                    self._model.to("cpu")
+
+            # Precompute static normalized prompt embeddings once
+            with torch.inference_mode():
+                text_inputs = self._processor(text=self.all_prompts, return_tensors="pt", padding=True)
+                if self.device != "cpu":
+                    text_inputs = {k: v.to(self.device) for k, v in text_inputs.items()}
+                text_output = self._model.get_text_features(**text_inputs)
+                text_embeds = text_output.pooler_output if hasattr(text_output, "pooler_output") else (text_output[0] if isinstance(text_output, tuple) else text_output)
+                self._text_weights = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
+            print("[INFO] CLIP model ready with precomputed prompt embeddings.")
 
     def classify_batch(self, pil_images: List[Image.Image]) -> List[Dict[str, Any]]:
         """
-        Runs prompt-ensembled CLIP inference.
+        Runs prompt-ensembled CLIP inference with precomputed text weights.
         Returns for each image: top category, margin, normalized entropy, and aggregated scores.
         """
         self._load_model()
@@ -512,9 +564,16 @@ class LocalClipEnsembleClassifier:
             return []
 
         try:
-            raw_results = self._pipeline(pil_images, candidate_labels=self.all_prompts, batch_size=len(pil_images))
-            if len(pil_images) == 1 and isinstance(raw_results, dict):
-                raw_results = [raw_results]
+            with torch.inference_mode():
+                img_inputs = self._processor(images=pil_images, return_tensors="pt")
+                if self.device != "cpu":
+                    img_inputs = {k: v.to(self.device) for k, v in img_inputs.items()}
+                img_output = self._model.get_image_features(**img_inputs)
+                img_embeds = img_output.pooler_output if hasattr(img_output, "pooler_output") else (img_output[0] if isinstance(img_output, tuple) else img_output)
+                img_embeds = img_embeds / img_embeds.norm(p=2, dim=-1, keepdim=True)
+                logit_scale = self._model.logit_scale.exp()
+                logits = torch.matmul(img_embeds, self._text_weights.t()) * logit_scale
+                probs_matrix = logits.softmax(dim=-1).cpu().numpy()
         except Exception as e:
             print(f"[WARN] CLIP ensemble inference error: {e}")
             return [{
@@ -527,13 +586,12 @@ class LocalClipEnsembleClassifier:
             } for _ in pil_images]
 
         output = []
-        for res in raw_results:
+        for row in probs_matrix:
             cat_sums = {"PHOTO": 0.0, "MEME": 0.0, "GREETING": 0.0}
-            for entry in res:
-                label = entry["label"]
-                score = float(entry["score"])
+            for idx, score in enumerate(row):
+                label = self.all_prompts[idx]
                 cat = self.prompt_to_category.get(label, "PHOTO")
-                cat_sums[cat] += score
+                cat_sums[cat] += float(score)
 
             total = sum(cat_sums.values()) or 1.0
             cat_probs = {k: v / total for k, v in cat_sums.items()}
@@ -932,9 +990,14 @@ def route_file(
     base_memories_dir: Optional[Path] = None,
     quarantine: bool = False,
     rescue: bool = False,
+    staged_info: Optional[Dict[str, Any]] = None,
 ) -> Optional[Path]:
     """
     Routes file into memories folder structure:
+    - If staged_info is provided (file is in a staging folder):
+        PHOTO    -> Returned to ~/memories/{original_year}/photos/{original_filename}
+        MEME     -> ~/memories/quarantine/{original_year}/memes/ (if quarantine) or ~/memories/{original_year}/memes/
+        GREETING -> ~/memories/quarantine/{original_year}/greetings/ (if quarantine) or ~/memories/{original_year}/greetings/
     - If rescue is True (or source is inside quarantine):
         PHOTO    -> ~/memories/{YYYY}/photos/
         MEME     -> ~/memories/quarantine/{YYYY}/memes/ (stays if already there)
@@ -944,7 +1007,47 @@ def route_file(
         MEME     -> ~/memories/quarantine/{YYYY}/memes/ (if quarantine=True) or ~/memories/{YYYY}/memes/
         GREETING -> ~/memories/quarantine/{YYYY}/greetings/ (if quarantine=True) or ~/memories/{YYYY}/greetings/
     """
-    if action == "dry-run" or category == "UNKNOWN":
+    if category == "UNKNOWN":
+        return None
+
+    if staged_info:
+        orig_path = Path(staged_info["original_path"])
+        orig_year = str(staged_info.get("original_year")) if staged_info.get("original_year") else None
+        if not orig_year:
+            orig_year, memories_root = extract_year_and_memories_root(orig_path, base_memories_dir)
+        else:
+            _, memories_root = extract_year_and_memories_root(orig_path, base_memories_dir)
+
+        target_file_name = orig_path.name
+        if category == "PHOTO":
+            dest_dir = memories_root / orig_year / "photos"
+        elif category == "MEME":
+            dest_dir = memories_root / "quarantine" / orig_year / "memes" if quarantine else memories_root / orig_year / "memes"
+        elif category == "GREETING":
+            dest_dir = memories_root / "quarantine" / orig_year / "greetings" if quarantine else memories_root / orig_year / "greetings"
+        else:
+            return None
+
+        if action == "dry-run":
+            return dest_dir / target_file_name
+
+        if source_path.resolve() == (dest_dir / target_file_name).resolve():
+            return dest_dir / target_file_name
+
+        dest_path = get_unique_destination_path(dest_dir, target_file_name)
+        stat = source_path.stat()
+        if action == "move":
+            shutil.move(str(source_path), str(dest_path))
+        elif action == "copy":
+            shutil.copy2(str(source_path), str(dest_path))
+
+        try:
+            os.utime(dest_path, (stat.st_atime, stat.st_mtime))
+        except Exception:
+            pass
+        return dest_path
+
+    if action == "dry-run":
         return None
 
     is_in_quarantine = "quarantine" in source_path.parts
@@ -1047,30 +1150,35 @@ class EvaluationEngine:
                 continue
 
             try:
-                with Image.open(img_path) as raw_img:
-                    pil_rgb = ImagePreprocessor.safe_convert_rgb(ImagePreprocessor.correct_orientation(raw_img))
+                pil_rgb = ImagePreprocessor.load_rgb_image(img_path)
             except Exception as e:
                 print(f"[WARN] Could not open {img_path}: {e}")
                 continue
 
-            # 1. EXIF
+            # 1. Fast EXIF
             has_camera_exif, camera_info = exif_filter.is_camera_photo(img_path, pil_rgb)
 
-            # 2. OCR
-            if ocr_enabled:
-                ocr_data = ocr_engine.extract_features(img_path, pil_rgb, has_camera_exif=has_camera_exif)
-            else:
-                ocr_data = {"ocr_text": "", "ocr_confidence": 0.0, "text_box_count": 0, "text_area_ratio": 0.0}
-
-            # 3. Signals
-            signals = signal_extractor.extract_signals(pil_rgb, ocr_data, has_camera_exif)
-
-            # 4. CLIP
+            # 2. Fast CLIP Visual Triage
             if clip_enabled:
                 clip_results = clip_classifier.classify_batch([pil_rgb])
                 clip_data = clip_results[0]
             else:
                 clip_data = {"top_label": "PHOTO", "confidence": 0.5, "margin": 0.0, "entropy": 1.0}
+
+            # 3. Cascaded Selective OCR: Unambiguous camera photos skip heavy OCR sweeps
+            skip_ocr = (
+                has_camera_exif and
+                clip_data.get("top_label") == "PHOTO" and
+                clip_data.get("confidence", 0.0) >= 0.85
+            )
+
+            if ocr_enabled and not skip_ocr:
+                ocr_data = ocr_engine.extract_features(img_path, pil_rgb, has_camera_exif=has_camera_exif)
+            else:
+                ocr_data = {"ocr_text": "", "ocr_confidence": 0.0, "text_box_count": 0, "text_area_ratio": 0.0}
+
+            # 4. Signals
+            signals = signal_extractor.extract_signals(pil_rgb, ocr_data, has_camera_exif)
 
             # 5. Decision Engine
             decision = HierarchicalDecisionEngine.decide(
@@ -1235,6 +1343,7 @@ def main():
 
     # Discover images either from the current-run manifest or the standalone tree scan.
     image_paths = []
+    staged_metadata: Dict[str, Dict[str, Any]] = {}
     if args.input_manifest:
         manifest_path = Path(args.input_manifest).expanduser().resolve()
         if not manifest_path.exists():
@@ -1243,6 +1352,27 @@ def main():
         print(f"[INFO] Reading image manifest: {manifest_path}")
         with open(manifest_path, "r", encoding="utf-8") as manifest_file:
             for line in manifest_file:
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                if line_str.startswith("{") and line_str.endswith("}"):
+                    try:
+                        data = json.loads(line_str)
+                        staged = Path(data.get("staged_path", "")).expanduser().resolve()
+                        orig = Path(data.get("original_path", "")).expanduser().resolve()
+                        orig_year = data.get("original_year")
+                        if staged.is_file() and staged.suffix.lower() in SUPPORTED_EXTENSIONS:
+                            if str(orig) not in processed_paths and str(staged) not in processed_paths:
+                                image_paths.append(staged)
+                                staged_metadata[str(staged)] = {
+                                    "original_path": orig,
+                                    "original_year": orig_year,
+                                    "triage_category": data.get("triage_category"),
+                                    "triage_reason": data.get("triage_reason"),
+                                }
+                        continue
+                    except json.JSONDecodeError:
+                        pass
                 path = Path(line.rstrip("\r\n")).expanduser()
                 if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS and str(path) not in processed_paths:
                     image_paths.append(path)
@@ -1287,24 +1417,59 @@ def main():
     batch_size = max(1, args.batch_size)
     progress_bar = tqdm(total=total_images, desc="Classifying", unit="img")
 
-    for i in range(0, total_images, batch_size):
-        chunk = image_paths[i:i + batch_size]
-        chunk_results = []
-        clip_pending_images = []
-        clip_pending_indices = []
+    from concurrent.futures import ThreadPoolExecutor
+    io_pool = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 4))
 
-        # 1. Load images, extract EXIF, OCR, and Signals
-        for idx_in_chunk, img_path in enumerate(chunk):
-            try:
-                with Image.open(img_path) as raw_img:
-                    pil_rgb = ImagePreprocessor.safe_convert_rgb(ImagePreprocessor.correct_orientation(raw_img))
-            except Exception as e:
+    def load_item(p: Path) -> Dict[str, Any]:
+        has_cam, cam_info = exif_filter.is_camera_photo(p)
+        try:
+            img = ImagePreprocessor.load_rgb_image(p)
+            return {
+                "path": p,
+                "pil_image": img,
+                "has_camera_exif": has_cam,
+                "camera_info": cam_info,
+                "error": None,
+            }
+        except Exception as e:
+            return {
+                "path": p,
+                "pil_image": None,
+                "has_camera_exif": has_cam,
+                "camera_info": cam_info,
+                "error": str(e),
+            }
+
+    # Prime prefetcher with first batch
+    next_chunk_future = None
+    if total_images > 0:
+        first_chunk = image_paths[0:batch_size]
+        next_chunk_future = io_pool.map(load_item, first_chunk)
+
+    for i in range(0, total_images, batch_size):
+        loaded_items = list(next_chunk_future) if next_chunk_future is not None else []
+
+        # Trigger prefetch for the next batch asynchronously
+        next_idx = i + batch_size
+        if next_idx < total_images:
+            next_chunk = image_paths[next_idx:next_idx + batch_size]
+            next_chunk_future = io_pool.map(load_item, next_chunk)
+        else:
+            next_chunk_future = None
+
+        chunk_results = []
+        valid_items = []
+
+        for loaded in loaded_items:
+            img_path = loaded["path"]
+            err = loaded["error"]
+            if err or loaded["pil_image"] is None:
                 chunk_results.append({
                     "path": img_path,
                     "category": "UNKNOWN",
                     "confidence": 0.0,
                     "tier": "ERROR",
-                    "decision_reason": f"File read error: {e}",
+                    "decision_reason": f"File read error: {err}",
                     "ocr_data": {},
                     "signals": {},
                     "clip_data": None,
@@ -1313,86 +1478,77 @@ def main():
                 })
                 continue
 
-            has_camera_exif, camera_info = exif_filter.is_camera_photo(img_path, pil_rgb)
+            item_dict = {
+                "path": img_path,
+                "pil_image": loaded["pil_image"],
+                "has_camera_exif": loaded["has_camera_exif"],
+                "camera_info": loaded["camera_info"],
+                "ocr_data": None,
+                "signals": None,
+                "decision": None,
+                "clip_data": None,
+            }
+            chunk_results.append(item_dict)
+            valid_items.append(item_dict)
 
-            if ocr_enabled:
+        # 1. Fast Batched CLIP Visual Triage
+        if valid_items and clip_enabled:
+            clip_outputs = clip_classifier.classify_batch([it["pil_image"] for it in valid_items])
+            for it, clip_res in zip(valid_items, clip_outputs):
+                it["clip_data"] = clip_res
+        elif valid_items and not clip_enabled:
+            for it in valid_items:
+                it["clip_data"] = {"top_label": "PHOTO", "confidence": 0.50, "margin": 0.0, "entropy": 1.0}
+
+        # 2. Cascaded Selective OCR & Decision Engine
+        for it in valid_items:
+            img_path = it["path"]
+            pil_rgb = it["pil_image"]
+            has_camera_exif = it["has_camera_exif"]
+            clip_data = it["clip_data"] or {}
+
+            # Layout check
+            w, h = pil_rgb.size
+            aspect_ratio = float(w) / float(max(h, 1))
+            is_screenshot_ratio = (
+                (0.45 <= aspect_ratio <= 0.60) or
+                (1.65 <= aspect_ratio <= 2.25)
+            )
+
+            # Cascaded bypass: Unambiguous camera photos skip heavy OCR
+            skip_ocr = (
+                has_camera_exif and
+                clip_data.get("top_label") == "PHOTO" and
+                clip_data.get("confidence", 0.0) >= 0.85 and
+                not is_screenshot_ratio
+            )
+
+            if ocr_enabled and not skip_ocr:
                 ocr_data = ocr_engine.extract_features(img_path, pil_rgb, has_camera_exif=has_camera_exif)
             else:
-                ocr_data = {"ocr_text": "", "ocr_confidence": 0.0, "text_box_count": 0, "text_area_ratio": 0.0}
+                ocr_data = {
+                    "ocr_text": "",
+                    "ocr_confidence": 0.0,
+                    "text_box_count": 0,
+                    "text_area_ratio": 0.0,
+                    "boxes": [],
+                    "top_band_count": 0,
+                    "bottom_band_count": 0,
+                }
+            it["ocr_data"] = ocr_data
 
             signals = signal_extractor.extract_signals(pil_rgb, ocr_data, has_camera_exif)
+            it["signals"] = signals
 
-            # Fast-path: obvious greeting or meme keywords can bypass CLIP
-            if signals.get("greeting_keyword_hits"):
-                decision = HierarchicalDecisionEngine.decide(
-                    has_camera_exif, camera_info, ocr_data, signals,
-                    {"top_label": "GREETING", "confidence": 0.90, "margin": 0.50, "entropy": 0.20},
-                    review_threshold=args.review_threshold,
-                )
-                chunk_results.append({
-                    "path": img_path,
-                    "pil_image": pil_rgb,
-                    "ocr_data": ocr_data,
-                    "signals": signals,
-                    "decision": decision,
-                    "clip_data": {"top_label": "GREETING", "margin": 0.50},
-                })
-            elif signals.get("meme_keyword_hits") and (ocr_data.get("ocr_confidence", 0) > 0.40 or signals.get("is_likely_screenshot")):
-                decision = HierarchicalDecisionEngine.decide(
-                    has_camera_exif, camera_info, ocr_data, signals,
-                    {"top_label": "MEME", "confidence": 0.90, "margin": 0.50, "entropy": 0.20},
-                    review_threshold=args.review_threshold,
-                )
-                chunk_results.append({
-                    "path": img_path,
-                    "pil_image": pil_rgb,
-                    "ocr_data": ocr_data,
-                    "signals": signals,
-                    "decision": decision,
-                    "clip_data": {"top_label": "MEME", "margin": 0.50},
-                })
-            else:
-                chunk_results.append({
-                    "path": img_path,
-                    "pil_image": pil_rgb,
-                    "has_camera_exif": has_camera_exif,
-                    "camera_info": camera_info,
-                    "ocr_data": ocr_data,
-                    "signals": signals,
-                    "decision": None,
-                    "clip_data": None,
-                })
-                clip_pending_images.append(pil_rgb)
-                clip_pending_indices.append(len(chunk_results) - 1)
-
-        # 2. Batched CLIP inference on remaining items
-        if clip_pending_images and clip_enabled:
-            clip_outputs = clip_classifier.classify_batch(clip_pending_images)
-            for chunk_res_idx, clip_data in zip(clip_pending_indices, clip_outputs):
-                item = chunk_results[chunk_res_idx]
-                decision = HierarchicalDecisionEngine.decide(
-                    item["has_camera_exif"],
-                    item["camera_info"],
-                    item["ocr_data"],
-                    item["signals"],
-                    clip_data,
-                    review_threshold=args.review_threshold,
-                )
-                item["decision"] = decision
-                item["clip_data"] = clip_data
-        elif clip_pending_images and not clip_enabled:
-            for chunk_res_idx in clip_pending_indices:
-                item = chunk_results[chunk_res_idx]
-                decision = HierarchicalDecisionEngine.decide(
-                    item["has_camera_exif"],
-                    item["camera_info"],
-                    item["ocr_data"],
-                    item["signals"],
-                    {"top_label": "PHOTO", "confidence": 0.50, "margin": 0.0, "entropy": 1.0},
-                    review_threshold=args.review_threshold,
-                )
-                item["decision"] = decision
-                item["clip_data"] = {"top_label": "PHOTO", "margin": 0.0}
+            decision = HierarchicalDecisionEngine.decide(
+                has_camera_exif,
+                it["camera_info"],
+                ocr_data,
+                signals,
+                clip_data,
+                review_threshold=args.review_threshold,
+            )
+            it["decision"] = decision
 
         # 3. Gemini Fallback for high uncertainty items
         for item in chunk_results:
@@ -1451,12 +1607,15 @@ def main():
             greeting_hits_str = "|".join(signals.get("greeting_keyword_hits", []))
             meme_hits_str = "|".join(signals.get("meme_keyword_hits", []))
 
+            staged_info = staged_metadata.get(str(img_path))
+            logged_file_path = str(staged_info["original_path"]) if staged_info else str(img_path)
+
             relocated_to = ""
             # In review mode, protect uncertain items: never move/alter them!
             if needs_review:
                 stats["REVIEW"] += 1
                 review_writer.writerow([
-                    str(img_path), category, f"{confidence:.4f}", tier, decision_reason,
+                    logged_file_path, category, f"{confidence:.4f}", tier, decision_reason,
                     ocr_text_clean, f"{ocr_conf:.4f}", text_box_count, f"{text_area_ratio:.4f}",
                     clip_top, f"{clip_margin:.4f}", greeting_hits_str, meme_hits_str,
                     f"{uncertainty:.4f}", MODEL_VERSION, "", time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1466,7 +1625,8 @@ def main():
                 try:
                     new_path = route_file(
                         img_path, category, args.action, source_root,
-                        quarantine=args.quarantine, rescue=args.rescue
+                        quarantine=args.quarantine, rescue=args.rescue,
+                        staged_info=staged_info
                     )
                     if new_path:
                         relocated_to = str(new_path)
@@ -1478,14 +1638,14 @@ def main():
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
             csv_writer.writerow([
-                str(img_path), category, f"{confidence:.4f}", tier, decision_reason,
+                logged_file_path, category, f"{confidence:.4f}", tier, decision_reason,
                 ocr_text_clean, f"{ocr_conf:.4f}", text_box_count, f"{text_area_ratio:.4f}",
                 clip_top, f"{clip_margin:.4f}", greeting_hits_str, meme_hits_str,
                 f"{uncertainty:.4f}", MODEL_VERSION, relocated_to, timestamp
             ])
 
         csv_handle.flush()
-        progress_bar.update(len(chunk))
+        progress_bar.update(len(loaded_items))
         progress_bar.set_postfix({
             "photos": category_stats.get("PHOTO", 0),
             "memes": category_stats.get("MEME", 0),
@@ -1493,6 +1653,7 @@ def main():
             "review": stats.get("REVIEW", 0),
         })
 
+    io_pool.shutdown(wait=False)
     csv_handle.close()
     review_handle.close()
     progress_bar.close()
