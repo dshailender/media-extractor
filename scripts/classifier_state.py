@@ -69,6 +69,8 @@ class DiscoverySummary:
     estimated_seconds_remaining: int
     estimated_time_formatted: str
     candidate_paths: List[str]
+    seconds_per_image: float = 3.8
+    rate_source: str = "calibrated_baseline"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -94,13 +96,33 @@ def format_duration(seconds: int) -> str:
     return f"{hours}h"
 
 
-def estimate_processing_time(item_count: int, cpu_cores: Optional[int] = None) -> Tuple[int, str]:
+DEFAULT_CALIBRATED_SECONDS_PER_IMAGE = 3.8
+
+
+def estimate_processing_time(
+    item_count: int,
+    cpu_cores: Optional[int] = None,
+    measured_seconds_per_image: Optional[float] = None,
+) -> Tuple[int, str, float, str]:
+    """
+    Estimates total processing time based on actual measured processing time per image
+    when available in SQLite state, otherwise falling back to calibrated multi-modal inference baseline (~3.8s/img).
+    Returns: (eta_seconds, formatted_eta, seconds_per_image, rate_source).
+    """
+    if item_count <= 0:
+        return 0, "< 1s", DEFAULT_CALIBRATED_SECONDS_PER_IMAGE, "calibrated_baseline"
+
     cores = cpu_cores if cpu_cores and cpu_cores > 0 else (os.cpu_count() or 4)
-    # CPU multi-modal inference throughput (CLIP + EasyOCR + EXIF with batching and threads)
-    # Calibrated to ~4.5 items/second per CPU core, bounded between 1.0 and 60.0 items/sec
-    est_rate = max(1.0, min(cores * 4.5, 60.0))
-    eta_sec = int(item_count / est_rate) if item_count > 0 else 0
-    return eta_sec, format_duration(eta_sec)
+    if measured_seconds_per_image is not None and measured_seconds_per_image > 0:
+        sec_per_img = measured_seconds_per_image
+        source = "measured_history"
+    else:
+        # Calibrated default for CLIP + EasyOCR + Gemini fallback on CPU (~3.5-4.2s per image)
+        sec_per_img = max(2.0, min(5.0, DEFAULT_CALIBRATED_SECONDS_PER_IMAGE - (min(cores, 16) - 4) * 0.05))
+        source = "calibrated_baseline"
+
+    eta_sec = int(round(item_count * sec_per_img))
+    return eta_sec, format_duration(eta_sec), round(sec_per_img, 2), source
 
 
 RESUMABLE_STATUSES = {
@@ -1197,6 +1219,55 @@ class ClassifierStateStore:
 
         return written_output
 
+    def get_measured_seconds_per_image(self) -> Optional[float]:
+        """
+        Computes actual average processing time per image (seconds/image) based on
+        completed items and their transition timestamps in SQLite.
+        Returns None if no historical data is available.
+        """
+        try:
+            with self._get_connection() as conn:
+                cur = conn.execute("""
+                    SELECT
+                        count(*) as count,
+                        (julianday(max(timestamp)) - julianday(min(timestamp))) * 86400.0 as duration_sec
+                    FROM classifier_transitions
+                    WHERE to_status = 'COMPLETED'
+                    GROUP BY run_id
+                    HAVING count >= 4;
+                """)
+                rows = cur.fetchall()
+                if rows:
+                    total_dur = sum(r["duration_sec"] for r in rows if r["duration_sec"] and r["duration_sec"] > 0)
+                    total_cnt = sum(r["count"] for r in rows if r["count"] and r["count"] > 0)
+                    if total_cnt >= 4 and total_dur > 0:
+                        avg_sec = total_dur / float(total_cnt)
+                        if 0.5 <= avg_sec <= 60.0:
+                            return round(avg_sec, 2)
+
+                # Fallback: check run table duration
+                cur = conn.execute("""
+                    SELECT
+                        r.run_id,
+                        (julianday(COALESCE(r.ended_at, r.heartbeat_at)) - julianday(r.started_at)) * 86400.0 as run_dur,
+                        count(i.item_id) as completed_items
+                    FROM classifier_runs r
+                    JOIN classifier_items i ON i.run_id = r.run_id AND i.status = 'COMPLETED' AND (i.tier IS NULL OR i.tier != 'EXIF_CAMERA')
+                    GROUP BY r.run_id
+                    HAVING completed_items >= 4;
+                """)
+                run_rows = cur.fetchall()
+                if run_rows:
+                    total_dur = sum(r["run_dur"] for r in run_rows if r["run_dur"] and r["run_dur"] > 0)
+                    total_cnt = sum(r["completed_items"] for r in run_rows if r["completed_items"] and r["completed_items"] > 0)
+                    if total_cnt >= 4 and total_dur > 0:
+                        avg_sec = total_dur / float(total_cnt)
+                        if 0.5 <= avg_sec <= 60.0:
+                            return round(avg_sec, 2)
+        except Exception:
+            pass
+        return None
+
     # -------------------------------------------------------------------------
     # Candidate Discovery & Progress Reconciliation
     # -------------------------------------------------------------------------
@@ -1372,7 +1443,10 @@ class ClassifierStateStore:
             remaining_pct = 0.0
 
         cpu_cores = os.cpu_count() or 4
-        eta_sec, eta_formatted = estimate_processing_time(len(final_candidates), cpu_cores)
+        measured_sec = self.get_measured_seconds_per_image()
+        eta_sec, eta_formatted, sec_per_img, rate_source = estimate_processing_time(
+            len(final_candidates), cpu_cores=cpu_cores, measured_seconds_per_image=measured_sec
+        )
 
         return DiscoverySummary(
             newly_extracted=newly_extracted_count,
@@ -1387,7 +1461,9 @@ class ClassifierStateStore:
             cpu_cores=cpu_cores,
             estimated_seconds_remaining=eta_sec,
             estimated_time_formatted=eta_formatted,
-            candidate_paths=[str(p) for p in final_candidates]
+            candidate_paths=[str(p) for p in final_candidates],
+            seconds_per_image=sec_per_img,
+            rate_source=rate_source,
         )
 
     def record_certified_items(
@@ -1516,7 +1592,7 @@ def main():
 
         total_considered = summary.already_completed + summary.final_candidates_count + summary.review_pending
         print(f"[INFO] Discovered candidates breakdown: newly_extracted={summary.newly_extracted}, filesystem={summary.filesystem_discovered}, db_resumed={summary.database_resumed}, staging_recovered={summary.staging_recovery}")
-        print(f"[INFO] Classification resume progress: {summary.completed_percentage:.1f}% previously completed ({summary.already_completed}/{total_considered} photos), {summary.remaining_percentage:.1f}% remaining ({summary.final_candidates_count}/{total_considered} photos) | Estimated remaining time: ~{summary.estimated_time_formatted} (based on {summary.cpu_cores} CPU cores)")
+        print(f"[INFO] Classification resume progress: {summary.completed_percentage:.1f}% previously completed ({summary.already_completed}/{total_considered} photos), {summary.remaining_percentage:.1f}% remaining ({summary.final_candidates_count}/{total_considered} photos) | Estimated remaining time: ~{summary.estimated_time_formatted} (~{summary.seconds_per_image:.1f}s/img via {summary.rate_source} on {summary.cpu_cores} CPUs)")
         if not args.output_json:
             print(json.dumps(out_data))
 

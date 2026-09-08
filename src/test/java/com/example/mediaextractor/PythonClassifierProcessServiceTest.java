@@ -182,13 +182,17 @@ class PythonClassifierProcessServiceTest {
         java.nio.file.Files.writeString(stateFile, "state");
 
         PythonClassifierProcessService service = new PythonClassifierProcessService();
-        List<Path> discovered = service.discoverCandidatesFallback(memoriesDir, List.of(), List.of()).candidatePaths();
+        PythonClassifierProcessService.CandidateDiscoveryResult result = service.discoverCandidatesFallback(memoriesDir, List.of(), List.of());
+        List<Path> discovered = result.candidatePaths();
         assertEquals(2, discovered.size());
         assertTrue(discovered.contains(img1.toAbsolutePath().normalize()));
         assertTrue(discovered.contains(img2.toAbsolutePath().normalize()));
         assertFalse(discovered.contains(stagedImg.toAbsolutePath().normalize()));
         assertFalse(discovered.contains(videoFile.toAbsolutePath().normalize()));
         assertFalse(discovered.contains(stateFile.toAbsolutePath().normalize()));
+        assertEquals(3.8, result.secondsPerImage());
+        assertEquals("calibrated_baseline", result.rateSource());
+        assertEquals("< 10s", result.estimatedTimeFormatted());
     }
 
     @Test

@@ -39,6 +39,7 @@ from classifier_state import (
     compute_file_fingerprint,
     compute_item_id,
     compute_sha256,
+    estimate_processing_time,
 )
 
 
@@ -581,10 +582,55 @@ class TestClassifierState(unittest.TestCase):
         self.assertEqual(data["final_candidates_count"], 1)
         self.assertEqual(data["already_completed"], 0)
         self.assertEqual(data["remaining_percentage"], 100.0)
+        self.assertIn("seconds_per_image", data)
+        self.assertIn("rate_source", data)
 
         paths = [p.strip() for p in out_paths.read_text(encoding="utf-8").splitlines() if p.strip()]
         self.assertEqual(len(paths), 1)
         self.assertEqual(paths[0], str(img_pending.resolve()))
+
+    def test_get_measured_seconds_per_image_and_estimation(self):
+        """Test historical throughput calculation from classifier_transitions and estimation fallback."""
+        store = ClassifierStateStore(self.db_path, run_id="run-measure-1")
+        store.acquire_lock()
+
+        # Fresh store has no history -> returns None
+        self.assertIsNone(store.get_measured_seconds_per_image())
+
+        # Fallback estimation without history uses calibrated baseline (~3.8s/img)
+        eta_sec, eta_fmt, sec_per_img, src = estimate_processing_time(10, cpu_cores=12, measured_seconds_per_image=None)
+        self.assertEqual(src, "calibrated_baseline")
+        self.assertGreaterEqual(sec_per_img, 2.0)
+        self.assertLessEqual(sec_per_img, 5.0)
+        self.assertGreater(eta_sec, 0)
+
+        # Insert 4 completed transitions spaced across 16 seconds (4.0s / img)
+        with store._get_connection() as conn:
+            timestamps = [
+                "2026-09-08T12:00:00.000Z",
+                "2026-09-08T12:00:04.000Z",
+                "2026-09-08T12:00:08.000Z",
+                "2026-09-08T12:00:16.000Z",
+            ]
+            for idx, ts in enumerate(timestamps):
+                conn.execute("""
+                    INSERT INTO classifier_transitions (item_id, from_status, to_status, run_id, timestamp, message)
+                    VALUES (?, 'ROUTING', 'COMPLETED', 'run-measure-1', ?, 'test');
+                """, (f"item-{idx}", ts))
+            conn.commit()
+
+        measured = store.get_measured_seconds_per_image()
+        self.assertIsNotNone(measured)
+        # 16 seconds across 4 items = 4.0s/img
+        self.assertAlmostEqual(measured, 4.0, places=1)
+
+        # ETA calculation with measured history
+        eta_sec2, eta_fmt2, sec_per_img2, src2 = estimate_processing_time(50, cpu_cores=12, measured_seconds_per_image=measured)
+        self.assertEqual(src2, "measured_history")
+        self.assertEqual(sec_per_img2, 4.0)
+        self.assertEqual(eta_sec2, 200) # 50 * 4.0 = 200s
+        self.assertEqual(eta_fmt2, "3m 20s")
+        store.release_lock()
 
 
 if __name__ == "__main__":

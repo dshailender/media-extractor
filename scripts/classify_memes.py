@@ -1550,7 +1550,7 @@ def main():
         total_considered = summary.already_completed + summary.final_candidates_count + summary.review_pending
 
         print(f"[INFO] Discovered candidates breakdown: newly_extracted={summary.newly_extracted}, filesystem={summary.filesystem_discovered}, db_resumed={summary.database_resumed}, staging_recovered={summary.staging_recovery}")
-        print(f"[INFO] Classification resume progress: {summary.completed_percentage:.1f}% previously completed ({summary.already_completed}/{total_considered} photos), {summary.remaining_percentage:.1f}% remaining ({summary.final_candidates_count}/{total_considered} photos) | Estimated remaining time: ~{summary.estimated_time_formatted} (based on {summary.cpu_cores} CPU cores)")
+        print(f"[INFO] Classification resume progress: {summary.completed_percentage:.1f}% previously completed ({summary.already_completed}/{total_considered} photos), {summary.remaining_percentage:.1f}% remaining ({summary.final_candidates_count}/{total_considered} photos) | Estimated remaining time: ~{summary.estimated_time_formatted} (~{summary.seconds_per_image:.1f}s/img via {summary.rate_source} on {summary.cpu_cores} CPUs)")
         if skipped_count > 0:
             print(f"[INFO] Resumed: skipped {skipped_count} completed files matching current state and fingerprint.")
 
@@ -1570,8 +1570,11 @@ def main():
             c_pct = round((skipped_count * 100.0) / total_manifest, 1)
             r_pct = round((len(image_paths) * 100.0) / total_manifest, 1)
             cpu_cores = os.cpu_count() or 4
-            _, eta_fmt = estimate_processing_time(len(image_paths), cpu_cores)
-            print(f"[INFO] Classification resume progress: {c_pct:.1f}% previously completed ({skipped_count}/{total_manifest} photos), {r_pct:.1f}% remaining ({len(image_paths)}/{total_manifest} photos) | Estimated remaining time: ~{eta_fmt} (based on {cpu_cores} CPU cores)")
+            measured_sec = state_store.get_measured_seconds_per_image()
+            _, eta_fmt, sec_per_img, rate_src = estimate_processing_time(
+                len(image_paths), cpu_cores=cpu_cores, measured_seconds_per_image=measured_sec
+            )
+            print(f"[INFO] Classification resume progress: {c_pct:.1f}% previously completed ({skipped_count}/{total_manifest} photos), {r_pct:.1f}% remaining ({len(image_paths)}/{total_manifest} photos) | Estimated remaining time: ~{eta_fmt} (~{sec_per_img:.1f}s/img via {rate_src} on {cpu_cores} CPUs)")
         elif skipped_count > 0:
             print(f"[INFO] Resumed: skipped {skipped_count} completed files matching current state and fingerprint.")
 

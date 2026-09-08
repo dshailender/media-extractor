@@ -105,18 +105,22 @@ public class PythonClassifierProcessService {
 
         int totalConsidered = discovery.alreadyCompleted() + discovery.candidatePaths().size() + discovery.reviewPending();
         if (totalConsidered > 0) {
-            log.info("Classification resume progress: {}% previously completed ({}/{} photos), {}% remaining ({}/{} photos) | Estimated remaining time: ~{} (based on {} CPU cores)",
+            log.info("Classification resume progress: {}% previously completed ({}/{} photos), {}% remaining ({}/{} photos) | Estimated remaining time: ~{} (~{}s/img via {} on {} CPUs)",
                     String.format(Locale.ROOT, "%.1f", discovery.completedPercentage()), discovery.alreadyCompleted(), totalConsidered,
                     String.format(Locale.ROOT, "%.1f", discovery.remainingPercentage()), discovery.candidatePaths().size(), totalConsidered,
-                    discovery.estimatedTimeFormatted(), discovery.cpuCores());
+                    discovery.estimatedTimeFormatted(),
+                    String.format(Locale.ROOT, "%.1f", discovery.secondsPerImage()),
+                    discovery.rateSource(),
+                    discovery.cpuCores());
         }
 
         if (discovery.newlyExtracted() == 0 && !discovery.candidatePaths().isEmpty()) {
-            log.info("Current extraction produced 0 images; discovered {} resumable classifier candidates under the memories directory ({}% completed, {}% remaining | ETA: ~{} on {} CPUs).",
+            log.info("Current extraction produced 0 images; discovered {} resumable classifier candidates under the memories directory ({}% completed, {}% remaining | ETA: ~{} at ~{}s/img on {} CPUs).",
                     discovery.candidatePaths().size(),
                     String.format(Locale.ROOT, "%.1f", discovery.completedPercentage()),
                     String.format(Locale.ROOT, "%.1f", discovery.remainingPercentage()),
                     discovery.estimatedTimeFormatted(),
+                    String.format(Locale.ROOT, "%.1f", discovery.secondsPerImage()),
                     discovery.cpuCores());
         }
 
@@ -340,7 +344,9 @@ public class PythonClassifierProcessService {
             double completedPercentage,
             double remainingPercentage,
             int cpuCores,
-            String estimatedTimeFormatted
+            String estimatedTimeFormatted,
+            double secondsPerImage,
+            String rateSource
     ) {}
 
     CandidateDiscoveryResult discoverCandidates(
@@ -414,6 +420,12 @@ public class PythonClassifierProcessService {
                         etaFormatted = "< 10s";
                     }
 
+                    double secondsPerImage = JavaClassifierTriageService.extractJsonDoubleField(json, "seconds_per_image", 3.8);
+                    String rateSource = JavaClassifierTriageService.extractJsonStringField(json, "rate_source");
+                    if (rateSource == null || rateSource.isBlank()) {
+                        rateSource = "calibrated_baseline";
+                    }
+
                     List<Path> candidatePaths = Files.readAllLines(candidatePathsFile, StandardCharsets.UTF_8).stream()
                             .map(String::trim)
                             .filter(s -> !s.isEmpty())
@@ -423,7 +435,8 @@ public class PythonClassifierProcessService {
                     return new CandidateDiscoveryResult(
                             newlyExtracted, fsDiscovered, dbResumed, stgRecovery,
                             alreadyCompleted, reviewPending, candidatePaths,
-                            completedPct, remainingPct, cpuCores, etaFormatted
+                            completedPct, remainingPct, cpuCores, etaFormatted,
+                            secondsPerImage, rateSource
                     );
                 }
             } catch (Exception e) {
@@ -488,14 +501,15 @@ public class PythonClassifierProcessService {
         }
 
         int cpuCores = Runtime.getRuntime().availableProcessors();
-        double estRate = Math.max(1.0, Math.min(cpuCores * 4.5, 60.0));
-        int etaSec = (int) (candidates.size() / estRate);
+        double secondsPerImage = 3.8;
+        int etaSec = (int) Math.round(candidates.size() * secondsPerImage);
         String etaFormatted = formatSeconds(etaSec);
 
         return new CandidateDiscoveryResult(
                 newlyExtracted, fsDiscovered, 0, stagingRecovery,
                 0, 0, new ArrayList<>(candidates),
-                0.0, candidates.isEmpty() ? 0.0 : 100.0, cpuCores, etaFormatted
+                0.0, candidates.isEmpty() ? 0.0 : 100.0, cpuCores, etaFormatted,
+                secondsPerImage, "calibrated_baseline"
         );
     }
 
