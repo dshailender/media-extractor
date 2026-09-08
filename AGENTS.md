@@ -54,7 +54,7 @@ src/test/java/com/example/mediaextractor/
 - **Key method**: `MediaExtractorService.copyMediaFileFlattened()`
 
 ### 3. **Concurrent Processing with Virtual Threads**
-- Uses Spring Boot 4.1.0 with Java 25 virtual threads for high-concurrency I/O
+- Uses Spring Boot 4.1.1 with Java 25 virtual threads for high-concurrency I/O
 - `ExecutorService` with `newVirtualThreadPerTaskExecutor()` for extraction phase
 - **Key places**: `MediaExtractorApplication.run()`, `MediaExtractorService.processArchive()`
 
