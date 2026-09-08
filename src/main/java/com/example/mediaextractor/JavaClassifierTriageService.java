@@ -317,13 +317,16 @@ public class JavaClassifierTriageService {
     /**
      * Safety recovery guarantee: restores any files remaining in the staging directory
      * back to their original photo path.
+    /**
+     * Safety recovery guarantee: restores any files remaining in the staging directory
+     * back to their original photo path.
      */
-    public int restoreStrandedFiles(TriageSummary summary) {
+    public List<Path> restoreStrandedFilesWithPaths(TriageSummary summary) {
         if (summary == null || summary.decisions() == null || summary.decisions().isEmpty()) {
-            return 0;
+            return List.of();
         }
 
-        int restored = 0;
+        List<Path> restored = new ArrayList<>();
         for (TriageDecision decision : summary.decisions()) {
             Path staged = decision.stagedPath();
             if (staged != null && Files.exists(staged) && !staged.equals(decision.originalPath())) {
@@ -333,6 +336,11 @@ public class JavaClassifierTriageService {
                         Files.createDirectories(dest.getParent());
                     }
                     if (Files.exists(dest)) {
+                        if (Files.size(staged) == Files.size(dest) && areFileContentsEqual(staged, dest)) {
+                            Files.deleteIfExists(staged);
+                            restored.add(dest.toAbsolutePath().normalize());
+                            continue;
+                        }
                         dest = getUniqueDestinationPath(dest.getParent(), dest.getFileName().toString());
                     }
                     try {
@@ -345,7 +353,7 @@ public class JavaClassifierTriageService {
                             Files.move(staged, dest);
                         }
                     }
-                    restored++;
+                    restored.add(dest.toAbsolutePath().normalize());
                     log.info("Safety restored stranded staged file {} back to {}", staged, dest);
                 } catch (Exception e) {
                     log.error("CRITICAL: Failed to restore stranded file {}: {}", staged, e.getMessage(), e);
@@ -353,6 +361,10 @@ public class JavaClassifierTriageService {
             }
         }
         return restored;
+    }
+
+    public int restoreStrandedFiles(TriageSummary summary) {
+        return restoreStrandedFilesWithPaths(summary).size();
     }
 
     /**
@@ -392,12 +404,12 @@ public class JavaClassifierTriageService {
      * reads their manifests, and recovers/restores candidate files safely back
      * to memories photos directories without overwriting existing files.
      */
-    public int recoverStaleStagingDirectories(Path baseMemoriesDir) {
+    public List<Path> recoverStaleStagingDirectoriesWithPaths(Path baseMemoriesDir) {
         if (baseMemoriesDir == null || !Files.isDirectory(baseMemoriesDir)) {
-            return 0;
+            return List.of();
         }
 
-        int totalRecovered = 0;
+        List<Path> totalRecovered = new ArrayList<>();
         try (var stream = Files.list(baseMemoriesDir)) {
             List<Path> stagingDirs = stream
                     .filter(Files::isDirectory)
@@ -405,7 +417,7 @@ public class JavaClassifierTriageService {
                     .toList();
 
             for (Path stagingDir : stagingDirs) {
-                totalRecovered += recoverStaleStagingDirectory(stagingDir, baseMemoriesDir);
+                totalRecovered.addAll(recoverStaleStagingDirectoryWithPaths(stagingDir, baseMemoriesDir));
             }
         } catch (IOException e) {
             log.error("Failed to scan for stale staging directories in {}: {}", baseMemoriesDir, e.getMessage(), e);
@@ -414,14 +426,18 @@ public class JavaClassifierTriageService {
         return totalRecovered;
     }
 
-    public int recoverStaleStagingDirectory(Path stagingDir, Path baseMemoriesDir) {
+    public int recoverStaleStagingDirectories(Path baseMemoriesDir) {
+        return recoverStaleStagingDirectoriesWithPaths(baseMemoriesDir).size();
+    }
+
+    public List<Path> recoverStaleStagingDirectoryWithPaths(Path stagingDir, Path baseMemoriesDir) {
         if (stagingDir == null || !Files.isDirectory(stagingDir)) {
-            return 0;
+            return List.of();
         }
 
         log.info("Recovering orphan staging directory: {}", stagingDir);
         Path manifestPath = stagingDir.resolve("manifest.jsonl");
-        int recovered = 0;
+        List<Path> recovered = new ArrayList<>();
         Set<Path> handledStagedFiles = new java.util.HashSet<>();
 
         if (Files.exists(manifestPath)) {
@@ -451,8 +467,10 @@ public class JavaClassifierTriageService {
                                 originalPath = baseMemoriesDir.resolve(String.valueOf(year)).resolve("photos").resolve(stagedPath.getFileName().toString());
                             }
 
-                            safeRestoreFile(stagedPath, originalPath);
-                            recovered++;
+                            Path restored = safeRestoreFile(stagedPath, originalPath);
+                            if (restored != null) {
+                                recovered.add(restored.toAbsolutePath().normalize());
+                            }
                         }
                     }
                 }
@@ -477,8 +495,10 @@ public class JavaClassifierTriageService {
                 }
                 int year = extractYearFromPhotosPath(loose);
                 Path dest = baseMemoriesDir.resolve(String.valueOf(year)).resolve("photos").resolve(targetName);
-                safeRestoreFile(loose, dest);
-                recovered++;
+                Path restored = safeRestoreFile(loose, dest);
+                if (restored != null) {
+                    recovered.add(restored.toAbsolutePath().normalize());
+                }
             }
         } catch (IOException e) {
             log.error("Error inspecting loose files in {}: {}", stagingDir, e.getMessage(), e);
@@ -503,7 +523,11 @@ public class JavaClassifierTriageService {
         return recovered;
     }
 
-    private static void safeRestoreFile(Path source, Path target) {
+    public int recoverStaleStagingDirectory(Path stagingDir, Path baseMemoriesDir) {
+        return recoverStaleStagingDirectoryWithPaths(stagingDir, baseMemoriesDir).size();
+    }
+
+    private static Path safeRestoreFile(Path source, Path target) {
         try {
             if (target.getParent() != null) {
                 Files.createDirectories(target.getParent());
@@ -512,7 +536,7 @@ public class JavaClassifierTriageService {
             if (Files.exists(dest)) {
                 if (Files.size(source) == Files.size(dest) && areFileContentsEqual(source, dest)) {
                     Files.deleteIfExists(source);
-                    return;
+                    return dest;
                 }
                 dest = getUniqueDestinationPath(target.getParent(), target.getFileName().toString());
             }
@@ -527,10 +551,13 @@ public class JavaClassifierTriageService {
                 }
             }
             log.info("Safely restored staged file {} -> {}", source, dest);
+            return dest;
         } catch (IOException e) {
             log.error("CRITICAL: Failed to restore staged file {}: {}", source, e.getMessage(), e);
+            return null;
         }
     }
+
 
     public static boolean areFileContentsEqual(Path path1, Path path2) {
         try {
@@ -606,6 +633,27 @@ public class JavaClassifierTriageService {
         if (start < end) {
             try {
                 return Integer.parseInt(json.substring(start, end));
+            } catch (NumberFormatException ignored) {}
+        }
+        return defaultValue;
+    }
+
+    static double extractJsonDoubleField(String json, String field, double defaultValue) {
+        int idx = json.indexOf("\"" + field + "\"");
+        if (idx < 0) return defaultValue;
+        int colonIdx = json.indexOf(":", idx + field.length() + 2);
+        if (colonIdx < 0) return defaultValue;
+        int start = colonIdx + 1;
+        while (start < json.length() && Character.isWhitespace(json.charAt(start))) {
+            start++;
+        }
+        int end = start;
+        while (end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-' || json.charAt(end) == '.')) {
+            end++;
+        }
+        if (start < end) {
+            try {
+                return Double.parseDouble(json.substring(start, end));
             } catch (NumberFormatException ignored) {}
         }
         return defaultValue;

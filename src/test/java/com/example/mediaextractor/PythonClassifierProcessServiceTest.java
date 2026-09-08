@@ -145,5 +145,73 @@ class PythonClassifierProcessServiceTest {
         assertTrue(java.nio.file.Files.exists(originalPhoto));
         assertEquals("staged-data", java.nio.file.Files.readString(originalPhoto));
     }
+
+    @Test
+    void testFormatSeconds() {
+        assertEquals("< 10s", PythonClassifierProcessService.formatSeconds(5));
+        assertEquals("1m 15s", PythonClassifierProcessService.formatSeconds(75));
+        assertEquals("1h 1m", PythonClassifierProcessService.formatSeconds(3700));
+        assertEquals("1h", PythonClassifierProcessService.formatSeconds(3600));
+    }
+
+    @Test
+    void testCandidateDiscoveryFallbackExcludesNonPhotos(@org.junit.jupiter.api.io.TempDir Path tempDir) throws java.io.IOException {
+        Path memoriesDir = tempDir.resolve("memories");
+        Path y2024Photos = memoriesDir.resolve("2024").resolve("photos");
+        Path y2023Photos = memoriesDir.resolve("2023").resolve("photos");
+        Path staging = memoriesDir.resolve(".staging-12345");
+        Path videos = memoriesDir.resolve("2024").resolve("videos");
+        Path state = memoriesDir.resolve(".classifier-state");
+
+        java.nio.file.Files.createDirectories(y2024Photos);
+        java.nio.file.Files.createDirectories(y2023Photos);
+        java.nio.file.Files.createDirectories(staging);
+        java.nio.file.Files.createDirectories(videos);
+        java.nio.file.Files.createDirectories(state);
+
+        Path img1 = y2024Photos.resolve("img1.jpg");
+        Path img2 = y2023Photos.resolve("img2.png");
+        Path stagedImg = staging.resolve("staged.jpg");
+        Path videoFile = videos.resolve("clip.mp4");
+        Path stateFile = state.resolve("dummy.jpg");
+
+        java.nio.file.Files.writeString(img1, "img1");
+        java.nio.file.Files.writeString(img2, "img2");
+        java.nio.file.Files.writeString(stagedImg, "staged");
+        java.nio.file.Files.writeString(videoFile, "video");
+        java.nio.file.Files.writeString(stateFile, "state");
+
+        PythonClassifierProcessService service = new PythonClassifierProcessService();
+        List<Path> discovered = service.discoverCandidatesFallback(memoriesDir, List.of(), List.of()).candidatePaths();
+        assertEquals(2, discovered.size());
+        assertTrue(discovered.contains(img1.toAbsolutePath().normalize()));
+        assertTrue(discovered.contains(img2.toAbsolutePath().normalize()));
+        assertFalse(discovered.contains(stagedImg.toAbsolutePath().normalize()));
+        assertFalse(discovered.contains(videoFile.toAbsolutePath().normalize()));
+        assertFalse(discovered.contains(stateFile.toAbsolutePath().normalize()));
+    }
+
+    @Test
+    void testEmptyExtractionDiscoversAndResumesRemainingPhotos(@org.junit.jupiter.api.io.TempDir Path tempDir) throws java.io.IOException {
+        Path memoriesDir = tempDir.resolve("memories");
+        Path y2024Photos = memoriesDir.resolve("2024").resolve("photos");
+        java.nio.file.Files.createDirectories(y2024Photos);
+
+        Path pendingPhoto = y2024Photos.resolve("pending.png");
+        java.awt.image.BufferedImage img = new java.awt.image.BufferedImage(400, 400, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+        javax.imageio.ImageIO.write(img, "png", pendingPhoto.toFile());
+
+        PythonClassifierProcessService service = new PythonClassifierProcessService();
+        MockEnvironment env = new MockEnvironment();
+        env.setProperty("media-extractor.classifier-enabled", "true");
+        env.setProperty("media-extractor.classifier-mode", "java-only");
+
+        // Pass empty extractedImagePaths (simulating a re-run where mediaExtractor found 0 new files)
+        service.classifyAfterExtraction(memoriesDir, List.of(), env);
+
+        // In java-only mode, the pending photo without EXIF camera hardware should have been triaged!
+        // Staged files were cleaned up or restored because python was not invoked.
+        assertTrue(java.nio.file.Files.exists(pendingPhoto));
+    }
 }
 

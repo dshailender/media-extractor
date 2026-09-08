@@ -24,12 +24,18 @@ if [ ! -f "${JAR_FILE}" ]; then
     ./mvnw package -DskipTests
 fi
 
-# 3. Source directory argument
-SOURCE_DIR="$1"
-if [ -z "${SOURCE_DIR}" ]; then
-    echo "Usage: $0 <source_directory> [options]"
+# 3. Source directory argument and options
+SOURCE_DIR=""
+if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+    SOURCE_DIR="$1"
+    shift
+fi
+
+if [ -z "${SOURCE_DIR}" ] && [ $# -eq 0 ]; then
+    echo "Usage: $0 [source_directory] [options]"
     echo ""
     echo "Options:"
+    echo "  --resume          Resume classification on existing ~/memories/{YYYY}/"
     echo "  --mode=<mode>     Classifier mode: java-triage-python (default), python, java-only, disabled"
     echo "  --dry-run         Run classifier in audit mode without moving memes/greetings"
     echo "  --no-classify     Skip Python classification entirely"
@@ -37,19 +43,22 @@ if [ -z "${SOURCE_DIR}" ]; then
     echo "  --no-resume       Disable resume and reprocess all files"
     echo "  --state-db=<path> Custom SQLite state database location"
     echo ""
-    echo "Example:"
+    echo "Examples:"
     echo "  $0 /path/to/backup"
     echo "  $0 /path/to/backup --dry-run"
+    echo "  $0 --resume"
+    echo "  $0 --dry-run"
     echo "  $0 /path/to/backup --mode=java-triage-python"
-    echo "  $0 /path/to/backup --mode=python"
     exit 1
 fi
 
-shift
-
 echo "=========================================================="
 echo "Media Extractor: Unified Extraction & Classification"
-echo "Source:          ${SOURCE_DIR}"
+if [ -n "${SOURCE_DIR}" ]; then
+    echo "Source:          ${SOURCE_DIR}"
+else
+    echo "Source:          [Existing ~/memories/ (Resume / Classifier-only)]"
+fi
 echo "Mode:            java-triage-python (default)"
 echo "Action:          move (default)"
 echo "Quarantine:      ~/memories/quarantine/{YYYY}/ (default)"
@@ -77,5 +86,12 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-java -jar "${JAR_FILE}" "${SOURCE_DIR}" "${EXTRA_ARGS[@]}"
+CMD=(java -jar "${JAR_FILE}")
+if [ -n "${SOURCE_DIR}" ]; then
+    CMD+=("${SOURCE_DIR}")
+fi
+CMD+=("${EXTRA_ARGS[@]}")
+
+"${CMD[@]}"
+
 

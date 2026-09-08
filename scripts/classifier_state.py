@@ -7,6 +7,7 @@ for the media-extractor classification pipeline.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import enum
 import errno
@@ -20,6 +21,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -43,6 +45,62 @@ class LifecycleStatus(str, enum.Enum):
     FAILED_RETRYABLE = "FAILED_RETRYABLE"
     FAILED_PERMANENT = "FAILED_PERMANENT"
     CANCELLED = "CANCELLED"
+
+
+SUPPORTED_PHOTO_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif",
+    ".heic", ".heif", ".avif", ".dng", ".cr2", ".nef", ".arw",
+    ".gif", ".raw"
+}
+
+
+@dataclass
+class DiscoverySummary:
+    newly_extracted: int
+    filesystem_discovered: int
+    database_resumed: int
+    staging_recovery: int
+    already_completed: int
+    review_pending: int
+    final_candidates_count: int
+    completed_percentage: float
+    remaining_percentage: float
+    cpu_cores: int
+    estimated_seconds_remaining: int
+    estimated_time_formatted: str
+    candidate_paths: List[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def format_duration(seconds: int) -> str:
+    if seconds <= 0:
+        return "< 1s"
+    if seconds < 10:
+        return "< 10s"
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    rem_sec = seconds % 60
+    if minutes < 60:
+        if rem_sec > 0:
+            return f"{minutes}m {rem_sec}s"
+        return f"{minutes}m"
+    hours = minutes // 60
+    rem_min = minutes % 60
+    if rem_min > 0:
+        return f"{hours}h {rem_min}m"
+    return f"{hours}h"
+
+
+def estimate_processing_time(item_count: int, cpu_cores: Optional[int] = None) -> Tuple[int, str]:
+    cores = cpu_cores if cpu_cores and cpu_cores > 0 else (os.cpu_count() or 4)
+    # CPU multi-modal inference throughput (CLIP + EasyOCR + EXIF with batching and threads)
+    # Calibrated to ~4.5 items/second per CPU core, bounded between 1.0 and 60.0 items/sec
+    est_rate = max(1.0, min(cores * 4.5, 60.0))
+    eta_sec = int(item_count / est_rate) if item_count > 0 else 0
+    return eta_sec, format_duration(eta_sec)
 
 
 RESUMABLE_STATUSES = {
@@ -188,8 +246,8 @@ class ClassifierStateStore:
 
     def __init__(
         self,
-        db_path: Path,
-        run_id: str,
+        db_path: Optional[Path] = None,
+        run_id: Optional[str] = None,
         lease_timeout_sec: float = 300.0,
         config_fingerprint: str = "",
         model_version: str = "",
@@ -199,8 +257,11 @@ class ClassifierStateStore:
         mode: str = "default",
         command_line: str = "",
     ):
-        self.db_path = db_path.resolve()
-        self.run_id = run_id
+        if db_path is None:
+            self.db_path = (Path.home() / "memories" / ".classifier-state" / "classification.sqlite3").resolve()
+        else:
+            self.db_path = db_path.resolve()
+        self.run_id = run_id or f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         self.lease_timeout_sec = max(0.05, float(lease_timeout_sec))
         self.config_fingerprint = config_fingerprint
         self.model_version = model_version
@@ -531,7 +592,7 @@ class ClassifierStateStore:
             conn.execute("BEGIN IMMEDIATE;")
             cur = conn.execute("""
                 SELECT * FROM classifier_runs
-                WHERE (status = 'RUNNING' OR status = 'ABANDONED') AND run_id != ?;
+                WHERE (status = 'RUNNING' OR status = 'ABANDONED' OR status = 'CANCELLED') AND run_id != ?;
             """, (self.run_id,))
             candidate_runs = cur.fetchall()
 
@@ -551,15 +612,15 @@ class ClassifierStateStore:
                 is_expired = (now_ts - hb_ts) > self.lease_timeout_sec
                 is_dead = (is_same_host and r_pid != current_pid and not self._is_pid_alive(r_pid))
 
-                if r_status == "ABANDONED" or is_dead or is_expired:
-                    if r_status != "ABANDONED":
+                if r_status in ("ABANDONED", "CANCELLED") or is_dead or is_expired:
+                    if r_status != "ABANDONED" and r_status != "CANCELLED":
                         conn.execute(
                             "UPDATE classifier_runs SET status = 'ABANDONED', ended_at = ? WHERE run_id = ?;",
                             (now_iso, r_id)
                         )
                     item_cur = conn.execute("""
                         SELECT * FROM classifier_items
-                        WHERE run_id = ? AND status IN ('CLAIMED', 'CLASSIFYING', 'CLASSIFIED', 'ROUTING');
+                        WHERE run_id = ? AND status IN ('CLAIMED', 'CLASSIFYING', 'CLASSIFIED', 'ROUTING', 'CANCELLED', 'FAILED_RETRYABLE');
                     """, (r_id,))
                     candidate_items.extend([ItemRecord.from_row(r) for r in item_cur.fetchall()])
 
@@ -567,9 +628,10 @@ class ClassifierStateStore:
 
         # Active reconciliation and poison-pill limits handled per-item
         for item in candidate_items:
-            # 1. If item was in ROUTING or CLASSIFIED, actively reconcile with filesystem
-            if item.status in (LifecycleStatus.ROUTING.value, LifecycleStatus.CLASSIFIED.value):
+            # 1. If item was in ROUTING, CLASSIFIED, CANCELLED, or FAILED_RETRYABLE with intended destination, actively reconcile
+            if item.status in (LifecycleStatus.ROUTING.value, LifecycleStatus.CLASSIFIED.value, LifecycleStatus.CANCELLED.value, LifecycleStatus.FAILED_RETRYABLE.value) and item.intended_destination:
                 outcome, res_path = self.reconcile_item(item)
+
                 if outcome in ("RESOLVED_DEST_EXISTS", "RESOLVED_BOTH_MATCH", "RESOLVED_ROUTED"):
                     recovered_count += 1
                     continue
@@ -1134,3 +1196,342 @@ class ClassifierStateStore:
             os.replace(tmp_review, review_csv)
 
         return written_output
+
+    # -------------------------------------------------------------------------
+    # Candidate Discovery & Progress Reconciliation
+    # -------------------------------------------------------------------------
+
+    def discover_candidates(
+        self,
+        source_dir: Path,
+        extra_paths: Optional[List[Path]] = None,
+        staging_recovered_paths: Optional[List[Path]] = None,
+        resume_enabled: bool = True,
+        rescue: bool = False,
+        fingerprint_strategy: str = "cheap",
+        config_fingerprint: Optional[str] = None,
+    ) -> DiscoverySummary:
+        """
+        Discovers, reconciles, and filters candidate images for classification.
+        Scans source_dir (under memories/{YYYY}/) and merges:
+        - newly extracted candidates (extra_paths)
+        - staging-recovered candidates (staging_recovered_paths)
+        - incomplete/resumable database items
+        - filesystem-discovered photos under memories/{YYYY}/
+        Skips already completed unchanged files and review-pending files when resume_enabled.
+        Calculates completion/remaining percentages and CPU-based estimated time remaining.
+        """
+        resolved_source = source_dir.resolve()
+        newly_extracted_set: Set[Path] = set()
+        for p in (extra_paths or []):
+            try:
+                res = p.resolve()
+                if res.is_file() and res.suffix.lower() in SUPPORTED_PHOTO_EXTENSIONS:
+                    newly_extracted_set.add(res)
+            except Exception:
+                pass
+        newly_extracted_count = len(newly_extracted_set)
+
+        staging_recovery_set: Set[Path] = set()
+        for p in (staging_recovered_paths or []):
+            try:
+                res = p.resolve()
+                if res.is_file() and res.suffix.lower() in SUPPORTED_PHOTO_EXTENSIONS:
+                    staging_recovery_set.add(res)
+            except Exception:
+                pass
+        staging_recovery_count = len(staging_recovery_set)
+
+        # Query database records once for fast in-memory indexing
+        items_by_path: Dict[str, sqlite3.Row] = {}
+        items_by_fingerprint: Dict[str, sqlite3.Row] = {}
+        db_resumed_set: Set[Path] = set()
+
+        with self._get_connection() as conn:
+            cur = conn.execute("""
+                SELECT item_id, canonical_path, original_path, staged_path, destination_path,
+                       fingerprint, status, config_fingerprint
+                FROM classifier_items;
+            """)
+            for row in cur.fetchall():
+                can_p = row["canonical_path"]
+                orig_p = row["original_path"]
+                stg_p = row["staged_path"]
+                dest_p = row["destination_path"]
+                fp = row["fingerprint"]
+                st = row["status"]
+
+                if can_p:
+                    items_by_path[can_p] = row
+                if orig_p:
+                    items_by_path[orig_p] = row
+                if dest_p:
+                    items_by_path[dest_p] = row
+                if fp:
+                    items_by_fingerprint[fp] = row
+
+                # Check if item is incomplete/resumable in database
+                if st in RESUMABLE_STATUSES:
+                    for check_str in (orig_p, can_p, stg_p):
+                        if check_str:
+                            try:
+                                candidate_p = Path(check_str).resolve()
+                                if candidate_p.is_file() and candidate_p.suffix.lower() in SUPPORTED_PHOTO_EXTENSIONS:
+                                    db_resumed_set.add(candidate_p)
+                                    break
+                            except Exception:
+                                pass
+
+        database_resumed_count = len(db_resumed_set)
+
+        # Filesystem scan under source_dir
+        fs_discovered_set: Set[Path] = set()
+        if resolved_source.is_dir():
+            for root, dirs, files in os.walk(resolved_source):
+                # Prune transient/non-photo directories
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith(".")
+                    and not d.startswith(".staging-")
+                    and d != ".classifier-state"
+                    and d.lower() != "videos"
+                    and (rescue or d != "quarantine")
+                ]
+                for f in files:
+                    if f.startswith("media-extraction-report-"):
+                        continue
+                    p = (Path(root) / f).resolve()
+                    if p.suffix.lower() in SUPPORTED_PHOTO_EXTENSIONS:
+                        fs_discovered_set.add(p)
+
+        filesystem_discovered_count = len(fs_discovered_set)
+
+        # Merge all discovered paths deterministically
+        all_paths: List[Path] = []
+        seen: Set[Path] = set()
+        for path_group in (extra_paths or [], staging_recovered_paths or [], list(db_resumed_set), list(fs_discovered_set)):
+            for p in path_group:
+                try:
+                    res = p.resolve()
+                    if res not in seen and res.is_file() and res.suffix.lower() in SUPPORTED_PHOTO_EXTENSIONS:
+                        seen.add(res)
+                        all_paths.append(res)
+                except Exception:
+                    pass
+
+        already_completed_count = 0
+        review_pending_count = 0
+        final_candidates: List[Path] = []
+
+        for p in all_paths:
+            p_str = str(p)
+            if not resume_enabled:
+                final_candidates.append(p)
+                continue
+
+            try:
+                fp, sz, mt = compute_file_fingerprint(p, strategy=fingerprint_strategy)
+            except Exception:
+                continue
+
+            item = items_by_path.get(p_str) or items_by_fingerprint.get(fp)
+            if item:
+                st = item["status"]
+                item_fp = item["fingerprint"]
+                item_cfg = item["config_fingerprint"]
+
+                if st == LifecycleStatus.COMPLETED.value:
+                    if config_fingerprint is None or item_cfg == config_fingerprint:
+                        if item_fp == fp:
+                            already_completed_count += 1
+                            continue
+                        else:
+                            # Modified file
+                            final_candidates.append(p)
+                            continue
+                    else:
+                        # Invalidation due to config/model change
+                        final_candidates.append(p)
+                        continue
+                elif st == LifecycleStatus.REVIEW_PENDING.value:
+                    if item_fp == fp:
+                        review_pending_count += 1
+                        continue
+                    else:
+                        final_candidates.append(p)
+                        continue
+
+            final_candidates.append(p)
+
+        total_photos = already_completed_count + len(final_candidates) + review_pending_count
+        if total_photos > 0:
+            completed_pct = round((already_completed_count * 100.0) / total_photos, 1)
+            remaining_pct = round((len(final_candidates) * 100.0) / total_photos, 1)
+        else:
+            completed_pct = 100.0 if already_completed_count > 0 else 0.0
+            remaining_pct = 0.0
+
+        cpu_cores = os.cpu_count() or 4
+        eta_sec, eta_formatted = estimate_processing_time(len(final_candidates), cpu_cores)
+
+        return DiscoverySummary(
+            newly_extracted=newly_extracted_count,
+            filesystem_discovered=filesystem_discovered_count,
+            database_resumed=database_resumed_count,
+            staging_recovery=staging_recovery_count,
+            already_completed=already_completed_count,
+            review_pending=review_pending_count,
+            final_candidates_count=len(final_candidates),
+            completed_percentage=completed_pct,
+            remaining_percentage=remaining_pct,
+            cpu_cores=cpu_cores,
+            estimated_seconds_remaining=eta_sec,
+            estimated_time_formatted=eta_formatted,
+            candidate_paths=[str(p) for p in final_candidates]
+        )
+
+    def record_certified_items(
+        self,
+        paths: Sequence[Union[str, Path]],
+        decision_reason: str = "Certified camera photo (Java triage)",
+        config_fingerprint: Optional[str] = None,
+        strategy: str = "cheap"
+    ) -> int:
+        """
+        Records camera photos certified by Java triage directly as COMPLETED in SQLite,
+        allowing subsequent runs to skip them cleanly without repeating triage.
+        """
+        if not paths:
+            return 0
+        now_iso = current_iso_timestamp()
+        recorded = 0
+        with self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            for p in paths:
+                try:
+                    resolved = Path(p).resolve()
+                    if not resolved.is_file():
+                        continue
+                    fp, sz, mt = compute_file_fingerprint(resolved, strategy=strategy)
+                    item_id = compute_item_id(str(resolved))
+                    conn.execute("""
+                        INSERT INTO classifier_items (
+                            item_id, canonical_path, original_path, file_size, mtime_ns,
+                            fingerprint, status, category, confidence, tier,
+                            decision_reason, uncertainty, intended_destination, destination_path,
+                            config_fingerprint, run_id, attempt_count, created_at, updated_at
+                        ) VALUES (
+                            ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?,
+                            ?, ?, 1, ?, ?
+                        )
+                        ON CONFLICT(item_id) DO UPDATE SET
+                            fingerprint = excluded.fingerprint,
+                            status = excluded.status,
+                            category = excluded.category,
+                            confidence = excluded.confidence,
+                            tier = excluded.tier,
+                            decision_reason = excluded.decision_reason,
+                            destination_path = excluded.destination_path,
+                            config_fingerprint = excluded.config_fingerprint,
+                            updated_at = excluded.updated_at;
+                    """, (
+                        item_id, str(resolved), str(resolved), sz, mt,
+                        fp, LifecycleStatus.COMPLETED.value, "PHOTO", 1.0, "EXIF_CAMERA",
+                        decision_reason, 0.0, str(resolved), str(resolved),
+                        config_fingerprint, self.run_id, now_iso, now_iso
+                    ))
+                    recorded += 1
+                except Exception:
+                    continue
+            conn.execute("COMMIT;")
+        return recorded
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Media Extractor state store & candidate discovery CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Subcommand: discover
+    p_disc = subparsers.add_parser("discover", help="Discover and reconcile pending classification candidates")
+    p_disc.add_argument("--source-dir", type=str, required=True, help="Base memories directory")
+    p_disc.add_argument("--state-db", type=str, default=None, help="Path to SQLite state database")
+    p_disc.add_argument("--extra-paths-file", type=str, default=None, help="File containing newly extracted paths (one per line)")
+    p_disc.add_argument("--staging-recovered-file", type=str, default=None, help="File containing staging-recovered paths (one per line)")
+    p_disc.add_argument("--output-json", type=str, default=None, help="Path to write JSON discovery summary")
+    p_disc.add_argument("--output-paths-file", type=str, default=None, help="Path to write candidate paths (one per line)")
+    p_disc.add_argument("--fingerprint-strategy", type=str, default="cheap", choices=["cheap", "full-sha256"])
+    p_disc.add_argument("--config-fingerprint", type=str, default=None, help="Run configuration fingerprint")
+    p_disc.add_argument("--no-resume", action="store_true", help="Disable resume and return all discovered candidates")
+    p_disc.add_argument("--rescue", action="store_true", help="Enable rescue mode (includes quarantine directory)")
+
+    # Subcommand: record-certified
+    p_cert = subparsers.add_parser("record-certified", help="Record Java-certified camera photos as COMPLETED")
+    p_cert.add_argument("--state-db", type=str, default=None, help="Path to SQLite state database")
+    p_cert.add_argument("--paths-file", type=str, required=True, help="File containing certified photo paths")
+    p_cert.add_argument("--config-fingerprint", type=str, default=None)
+    p_cert.add_argument("--fingerprint-strategy", type=str, default="cheap")
+
+    args = parser.parse_args()
+
+    db_path = Path(args.state_db) if args.state_db else None
+    state_store = ClassifierStateStore(db_path=db_path)
+
+    if args.command == "discover":
+        extra_paths: List[Path] = []
+        if args.extra_paths_file and os.path.exists(args.extra_paths_file):
+            with open(args.extra_paths_file, "r", encoding="utf-8") as f:
+                extra_paths = [Path(line.strip()) for line in f if line.strip()]
+
+        staging_paths: List[Path] = []
+        if args.staging_recovered_file and os.path.exists(args.staging_recovered_file):
+            with open(args.staging_recovered_file, "r", encoding="utf-8") as f:
+                staging_paths = [Path(line.strip()) for line in f if line.strip()]
+
+        summary = state_store.discover_candidates(
+            source_dir=Path(args.source_dir),
+            extra_paths=extra_paths,
+            staging_recovered_paths=staging_paths,
+            resume_enabled=not args.no_resume,
+            rescue=args.rescue,
+            fingerprint_strategy=args.fingerprint_strategy,
+            config_fingerprint=args.config_fingerprint
+        )
+
+        out_data = summary.to_dict()
+        if args.output_json:
+            out_p = Path(args.output_json)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_p, "w", encoding="utf-8") as f:
+                json.dump(out_data, f, indent=2)
+
+        if args.output_paths_file:
+            out_paths_p = Path(args.output_paths_file)
+            out_paths_p.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_paths_p, "w", encoding="utf-8") as f:
+                for cp in summary.candidate_paths:
+                    f.write(f"{cp}\n")
+
+
+        total_considered = summary.already_completed + summary.final_candidates_count + summary.review_pending
+        print(f"[INFO] Discovered candidates breakdown: newly_extracted={summary.newly_extracted}, filesystem={summary.filesystem_discovered}, db_resumed={summary.database_resumed}, staging_recovered={summary.staging_recovery}")
+        print(f"[INFO] Classification resume progress: {summary.completed_percentage:.1f}% previously completed ({summary.already_completed}/{total_considered} photos), {summary.remaining_percentage:.1f}% remaining ({summary.final_candidates_count}/{total_considered} photos) | Estimated remaining time: ~{summary.estimated_time_formatted} (based on {summary.cpu_cores} CPU cores)")
+        if not args.output_json:
+            print(json.dumps(out_data))
+
+    elif args.command == "record-certified":
+        paths: List[Path] = []
+        if os.path.exists(args.paths_file):
+            with open(args.paths_file, "r", encoding="utf-8") as f:
+                paths = [Path(line.strip()) for line in f if line.strip()]
+        rec = state_store.record_certified_items(
+            paths=paths,
+            config_fingerprint=args.config_fingerprint,
+            strategy=args.fingerprint_strategy
+        )
+        print(f"[INFO] Recorded {rec} certified photos in state store.")
+
+
+if __name__ == "__main__":
+    main()

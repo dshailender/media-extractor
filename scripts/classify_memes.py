@@ -39,6 +39,8 @@ from classifier_state import (
     LifecycleStatus,
     compute_file_fingerprint,
     compute_item_id,
+    estimate_processing_time,
+    format_duration,
 )
 
 import cv2
@@ -1536,29 +1538,46 @@ def main():
                     image_paths.append(path)
                     item_records[str(path)] = item_rec
     else:
-        print("[INFO] Scanning for image files...")
-        for root, _, files in os.walk(source_root):
-            if args.rescue and "valid" in Path(root).parts and "quarantine" in Path(root).parts:
-                continue
-            for f in files:
-                path = (Path(root) / f).resolve()
-                if path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                    try:
-                        fp, sz, mt = compute_file_fingerprint(path, strategy=args.fingerprint_strategy)
-                    except Exception:
-                        continue
-                    if resume_enabled and state_store.is_item_skippable(str(path), fp, config_fingerprint):
-                        skipped_count += 1
-                        continue
-                    item_rec = state_store.register_discovered_item(str(path), fp, sz, mt)
-                    image_paths.append(path)
-                    item_records[str(path)] = item_rec
+        print("[INFO] Scanning for image files using candidate discovery...")
+        summary = state_store.discover_candidates(
+            source_dir=source_root,
+            resume_enabled=resume_enabled,
+            rescue=args.rescue,
+            fingerprint_strategy=args.fingerprint_strategy,
+            config_fingerprint=config_fingerprint
+        )
+        skipped_count = summary.already_completed
+        total_considered = summary.already_completed + summary.final_candidates_count + summary.review_pending
 
-    if skipped_count > 0:
-        print(f"[INFO] Resumed: skipped {skipped_count} completed files matching current state and fingerprint.")
+        print(f"[INFO] Discovered candidates breakdown: newly_extracted={summary.newly_extracted}, filesystem={summary.filesystem_discovered}, db_resumed={summary.database_resumed}, staging_recovered={summary.staging_recovery}")
+        print(f"[INFO] Classification resume progress: {summary.completed_percentage:.1f}% previously completed ({summary.already_completed}/{total_considered} photos), {summary.remaining_percentage:.1f}% remaining ({summary.final_candidates_count}/{total_considered} photos) | Estimated remaining time: ~{summary.estimated_time_formatted} (based on {summary.cpu_cores} CPU cores)")
+        if skipped_count > 0:
+            print(f"[INFO] Resumed: skipped {skipped_count} completed files matching current state and fingerprint.")
+
+        for cand_str in summary.candidate_paths:
+            path = Path(cand_str)
+            try:
+                fp, sz, mt = compute_file_fingerprint(path, strategy=args.fingerprint_strategy)
+            except Exception:
+                continue
+            item_rec = state_store.register_discovered_item(str(path), fp, sz, mt)
+            image_paths.append(path)
+            item_records[str(path)] = item_rec
+
+    if args.input_manifest:
+        total_manifest = skipped_count + len(image_paths)
+        if total_manifest > 0 and skipped_count > 0:
+            c_pct = round((skipped_count * 100.0) / total_manifest, 1)
+            r_pct = round((len(image_paths) * 100.0) / total_manifest, 1)
+            cpu_cores = os.cpu_count() or 4
+            _, eta_fmt = estimate_processing_time(len(image_paths), cpu_cores)
+            print(f"[INFO] Classification resume progress: {c_pct:.1f}% previously completed ({skipped_count}/{total_manifest} photos), {r_pct:.1f}% remaining ({len(image_paths)}/{total_manifest} photos) | Estimated remaining time: ~{eta_fmt} (based on {cpu_cores} CPU cores)")
+        elif skipped_count > 0:
+            print(f"[INFO] Resumed: skipped {skipped_count} completed files matching current state and fingerprint.")
 
     if args.limit > 0:
         image_paths = image_paths[:args.limit]
+
 
     total_images = len(image_paths)
     print(f"[INFO] Found {total_images} new images to process.")

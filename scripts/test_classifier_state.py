@@ -20,8 +20,10 @@ Unit and integration tests for the SQLite progress-state store:
 """
 
 import csv
+import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -485,6 +487,104 @@ class TestClassifierState(unittest.TestCase):
         # Mismatched config fingerprint is NOT skippable
         self.assertFalse(store.is_item_skippable(str(sample_file), fp, config_fingerprint="cfg_v2"))
         store.release_lock()
+
+    def test_discover_candidates_with_resume_percentages_and_eta(self):
+        """Test candidate discovery correctly calculates completed/remaining percentages and CPU ETA."""
+        # Create year directories with photos
+        y2023_photos = self.memories_dir / "2023" / "photos"
+        y2023_photos.mkdir(parents=True)
+        img1 = y2023_photos / "photo1.jpg"
+        img2 = y2023_photos / "photo2.jpg"
+        img1.write_text("photo1-data")
+        img2.write_text("photo2-data")
+
+        y2024 = self.memories_dir / "2024"
+        y2024.mkdir(parents=True)
+        img3 = y2024 / "photo3.png"
+        img3.write_text("photo3-data")
+
+        store = ClassifierStateStore(self.db_path, run_id="run-disc-1")
+        store.acquire_lock()
+
+        # Mark img1 as COMPLETED
+        fp1, sz1, mt1 = compute_file_fingerprint(img1)
+        item1 = store.register_discovered_item(str(img1), fp1, sz1, mt1)
+        store.persist_classification_result(item1.item_id, "PHOTO", 0.99, "EXIF_CAMERA", "Device", 0.01, str(img1))
+        store.persist_routing_completed(item1.item_id, str(img1))
+
+        # Discover candidates
+        summary = store.discover_candidates(
+            source_dir=self.memories_dir,
+            resume_enabled=True,
+            rescue=False
+        )
+
+        # 3 total files: 1 already completed (img1), 2 remaining (img2, img3)
+        self.assertEqual(summary.already_completed, 1)
+        self.assertEqual(summary.final_candidates_count, 2)
+        self.assertAlmostEqual(summary.completed_percentage, 33.3, places=1)
+        self.assertAlmostEqual(summary.remaining_percentage, 66.7, places=1)
+        self.assertIn(str(img2.resolve()), summary.candidate_paths)
+        self.assertIn(str(img3.resolve()), summary.candidate_paths)
+        self.assertNotIn(str(img1.resolve()), summary.candidate_paths)
+        self.assertTrue(len(summary.estimated_time_formatted) > 0)
+        store.release_lock()
+
+    def test_record_certified_items(self):
+        """Test recording Java-certified camera photos directly as COMPLETED in SQLite."""
+        y2024_photos = self.memories_dir / "2024" / "photos"
+        y2024_photos.mkdir(parents=True)
+        cert_img = y2024_photos / "camera.jpg"
+        cert_img.write_text("camera-image")
+
+        store = ClassifierStateStore(self.db_path, run_id="run-cert-1")
+        store.acquire_lock()
+
+        count = store.record_certified_items([str(cert_img)], decision_reason="Camera EXIF certified by Java")
+        self.assertEqual(count, 1)
+
+        item = store.get_item_by_path(str(cert_img))
+        self.assertIsNotNone(item)
+        self.assertEqual(item.status, LifecycleStatus.COMPLETED.value)
+        self.assertEqual(item.category, "PHOTO")
+        self.assertEqual(item.tier, "EXIF_CAMERA")
+        self.assertEqual(item.decision_reason, "Camera EXIF certified by Java")
+        self.assertTrue(store.is_item_skippable(str(cert_img), item.fingerprint))
+        store.release_lock()
+
+    def test_cli_discover_subcommand(self):
+        """Test classifier_state.py discover CLI subcommand with output JSON and paths file."""
+        photos_dir = self.memories_dir / "2022" / "photos"
+        photos_dir.mkdir(parents=True)
+        img_pending = photos_dir / "pending.jpg"
+        img_pending.write_text("pending-data")
+
+        out_json = self.test_dir / "disc.json"
+        out_paths = self.test_dir / "paths.txt"
+
+        cmd = [
+            sys.executable,
+            str(Path(__file__).with_name("classifier_state.py")),
+            "discover",
+            "--state-db", str(self.db_path),
+            "--source-dir", str(self.memories_dir),
+            "--output-json", str(out_json),
+            "--output-paths-file", str(out_paths),
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+        self.assertTrue(out_json.exists())
+        self.assertTrue(out_paths.exists())
+
+        with open(out_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["final_candidates_count"], 1)
+        self.assertEqual(data["already_completed"], 0)
+        self.assertEqual(data["remaining_percentage"], 100.0)
+
+        paths = [p.strip() for p in out_paths.read_text(encoding="utf-8").splitlines() if p.strip()]
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(paths[0], str(img_pending.resolve()))
 
 
 if __name__ == "__main__":

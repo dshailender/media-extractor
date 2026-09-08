@@ -53,99 +53,23 @@ public class MediaExtractorApplication implements CommandLineRunner {
         mediaExtractorService.getMetadataService().setPhotoPrefix(photoPrefix);
         mediaExtractorService.getMetadataService().setVideoPrefix(videoPrefix);
 
-        boolean sanitizeMode = Arrays.stream(args).anyMatch(a -> a.equalsIgnoreCase("--sanitize") || a.equalsIgnoreCase("--clean"));
-        Path baseMemoriesDir = Path.of(System.getProperty("user.home")).resolve("memories").toAbsolutePath().normalize();
-
-        if (sanitizeMode) {
-            log.info("Sanitization mode requested. Sanitizing existing memories at {}", baseMemoriesDir);
-            MediaExtractorService.SanitizationReport report = mediaExtractorService.sanitizeMemories(baseMemoriesDir);
-            log.info("Sanitization completed: scanned={}, valid={}, corrupted={}, duplicates={}, renamed={}, cleanedDirectories={}",
-                    report.scanned(), report.valid(), report.corrupted(), report.duplicates(), report.renamed(), report.cleanedDirectories());
-            return;
-        }
-
-        String sourceArgument = Arrays.stream(args)
-                .filter(a -> !a.startsWith("--"))
-                .findFirst()
-                .orElse(null);
-
-        Path sourceDir = sourceArgument != null
-                ? Path.of(sourceArgument).toAbsolutePath().normalize()
-                : Path.of("C:\\Users\\Shailender\\projects\\backup").toAbsolutePath().normalize();
-
-        log.info("Starting media extraction workflow with sourceDir={}, outputBaseDir={}",
-                sourceDir, baseMemoriesDir);
-
-        if (!Files.exists(sourceDir)) {
-            log.error("Source directory does not exist: {}", sourceDir);
-            System.exit(1);
-        }
-
-        Files.createDirectories(baseMemoriesDir);
-        log.info("Base output directory ready at {}", baseMemoriesDir);
-
-        int configuredThreads = environment.getProperty("media-extractor.threads", Integer.class, 0);
-        int maxInFlight = environment.getProperty("media-extractor.max-in-flight", Integer.class, 256);
-        long progressInterval = environment.getProperty("media-extractor.progress-interval-ms", Long.class, 5000L);
-        String configuredReportDirectory = environment.getProperty("media-extractor.report-directory", "");
-        Path reportDirectory = configuredReportDirectory.isBlank()
-            ? baseMemoriesDir
-            : Path.of(configuredReportDirectory).toAbsolutePath().normalize();
-
-        ExecutorService configuredExecutor = configuredThreads > 0
-            ? Executors.newFixedThreadPool(configuredThreads)
-            : Executors.newVirtualThreadPerTaskExecutor();
-        try (ExecutorService executor = configuredExecutor;
-             ProgressReporter progress = new ProgressReporter(mediaExtractorService.startReport(), progressInterval)) {
-            Path tempDir = Files.createTempDirectory("media-extractor");
-            log.info("Created temporary directory for archive extraction: {}", tempDir);
-
-            boolean quarantineEnabled = environment.getProperty("media-extractor.quarantine-enabled", Boolean.class, true);
-            boolean preserveTimestamps = environment.getProperty("media-extractor.preserve-timestamps", Boolean.class, true);
-
-            mediaExtractorService.setExecutor(executor);
-            mediaExtractorService.setTempDir(tempDir);
-            mediaExtractorService.setMaxInFlight(maxInFlight);
-            mediaExtractorService.setQuarantineEnabled(quarantineEnabled);
-            mediaExtractorService.setPreserveTimestamps(preserveTimestamps);
-            progress.start();
-            mediaExtractorService.extractMedia(sourceDir, baseMemoriesDir);
-            executor.shutdown();
-            log.info("Waiting for extraction tasks to finish");
-            if (!executor.awaitTermination(1, TimeUnit.DAYS)) {
-                log.error("Timed out while waiting for extraction tasks to complete");
-            }
-            mediaExtractorService.finishReport();
-            ExtractionReport report = mediaExtractorService.getLastReport();
-            if (report != null) {
-                ExtractionReportWriter.ReportPaths reportPaths = new ExtractionReportWriter()
-                    .write(report, reportDirectory, sourceDir.toString(), baseMemoriesDir.toString());
-                log.info("Extraction report written to JSON={} and HTML={}", reportPaths.json(), reportPaths.html());
-                log.info("Extraction summary: scanned={}, extracted={}, duplicates={}, corrupted={}, quarantined={}, failed={}, durationMs={}, rate={}/s",
-                        report.scanned(), report.extracted(), report.duplicates(), report.corrupted(), report.quarantined(), report.failed(),
-                        report.durationMillis(), String.format("%.2f", report.filesPerSecond()));
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            log.error("Interrupted while waiting for tasks to complete", e);
-        } finally {
-            log.info("Cleaning up temporary extraction files");
-            mediaExtractorService.cleanupTempDir();
-        }
-
+        boolean sanitizeMode = false;
         Boolean classifierEnabledOverride = null;
         String classifierActionOverride = null;
         Boolean classifierQuarantineOverride = null;
         String classifierModeOverride = null;
+        String sourceArgument = null;
 
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
             String lower = arg.toLowerCase();
-            if (lower.startsWith("--mode=")) {
+            if (lower.equals("--sanitize") || lower.equals("--clean")) {
+                sanitizeMode = true;
+            } else if (lower.startsWith("--mode=")) {
                 classifierModeOverride = arg.substring("--mode=".length()).trim();
             } else if (lower.equals("--mode") && i + 1 < args.length) {
                 classifierModeOverride = args[++i].trim();
-            } else if (lower.equals("--classify")) {
+            } else if (lower.equals("--classify") || lower.equals("--resume")) {
                 classifierEnabledOverride = true;
             } else if (lower.equals("--no-classify")) {
                 classifierEnabledOverride = false;
@@ -158,11 +82,102 @@ public class MediaExtractorApplication implements CommandLineRunner {
             } else if (lower.equals("--copy") || lower.equals("--action=copy")) {
                 classifierEnabledOverride = true;
                 classifierActionOverride = "copy";
+            } else if (lower.startsWith("--action=")) {
+                classifierEnabledOverride = true;
+                classifierActionOverride = arg.substring("--action=".length()).trim();
+            } else if (lower.equals("--action") && i + 1 < args.length) {
+                classifierEnabledOverride = true;
+                classifierActionOverride = args[++i].trim();
             } else if (lower.equals("--quarantine") || lower.equals("--quarantine-memes")) {
                 classifierQuarantineOverride = true;
             } else if (lower.equals("--no-quarantine")) {
                 classifierQuarantineOverride = false;
+            } else if (!arg.startsWith("--") && sourceArgument == null) {
+                sourceArgument = arg;
             }
+        }
+
+        Path baseMemoriesDir = Path.of(System.getProperty("user.home")).resolve("memories").toAbsolutePath().normalize();
+
+        if (sanitizeMode) {
+            log.info("Sanitization mode requested. Sanitizing existing memories at {}", baseMemoriesDir);
+            MediaExtractorService.SanitizationReport report = mediaExtractorService.sanitizeMemories(baseMemoriesDir);
+            log.info("Sanitization completed: scanned={}, valid={}, corrupted={}, duplicates={}, renamed={}, cleanedDirectories={}",
+                    report.scanned(), report.valid(), report.corrupted(), report.duplicates(), report.renamed(), report.cleanedDirectories());
+            return;
+        }
+
+        Files.createDirectories(baseMemoriesDir);
+        log.info("Base output directory ready at {}", baseMemoriesDir);
+
+        boolean shouldExtract = sourceArgument != null || !Boolean.TRUE.equals(classifierEnabledOverride);
+        Path sourceDir = null;
+        if (sourceArgument != null) {
+            sourceDir = Path.of(sourceArgument).toAbsolutePath().normalize();
+        } else if (shouldExtract) {
+            sourceDir = Path.of("C:\\Users\\Shailender\\projects\\backup").toAbsolutePath().normalize();
+        }
+
+        if (shouldExtract) {
+            log.info("Starting media extraction workflow with sourceDir={}, outputBaseDir={}",
+                    sourceDir, baseMemoriesDir);
+
+            if (sourceDir == null || !Files.exists(sourceDir)) {
+                log.error("Source directory does not exist: {}", sourceDir);
+                System.exit(1);
+            }
+
+            int configuredThreads = environment.getProperty("media-extractor.threads", Integer.class, 0);
+            int maxInFlight = environment.getProperty("media-extractor.max-in-flight", Integer.class, 256);
+            long progressInterval = environment.getProperty("media-extractor.progress-interval-ms", Long.class, 5000L);
+            String configuredReportDirectory = environment.getProperty("media-extractor.report-directory", "");
+            Path reportDirectory = configuredReportDirectory.isBlank()
+                ? baseMemoriesDir
+                : Path.of(configuredReportDirectory).toAbsolutePath().normalize();
+
+            ExecutorService configuredExecutor = configuredThreads > 0
+                ? Executors.newFixedThreadPool(configuredThreads)
+                : Executors.newVirtualThreadPerTaskExecutor();
+            try (ExecutorService executor = configuredExecutor;
+                 ProgressReporter progress = new ProgressReporter(mediaExtractorService.startReport(), progressInterval)) {
+                Path tempDir = Files.createTempDirectory("media-extractor");
+                log.info("Created temporary directory for archive extraction: {}", tempDir);
+
+                boolean quarantineEnabled = environment.getProperty("media-extractor.quarantine-enabled", Boolean.class, true);
+                boolean preserveTimestamps = environment.getProperty("media-extractor.preserve-timestamps", Boolean.class, true);
+
+                mediaExtractorService.setExecutor(executor);
+                mediaExtractorService.setTempDir(tempDir);
+                mediaExtractorService.setMaxInFlight(maxInFlight);
+                mediaExtractorService.setQuarantineEnabled(quarantineEnabled);
+                mediaExtractorService.setPreserveTimestamps(preserveTimestamps);
+                progress.start();
+                mediaExtractorService.extractMedia(sourceDir, baseMemoriesDir);
+                executor.shutdown();
+                log.info("Waiting for extraction tasks to finish");
+                if (!executor.awaitTermination(1, TimeUnit.DAYS)) {
+                    log.error("Timed out while waiting for extraction tasks to complete");
+                }
+                mediaExtractorService.finishReport();
+                ExtractionReport report = mediaExtractorService.getLastReport();
+                if (report != null) {
+                    ExtractionReportWriter.ReportPaths reportPaths = new ExtractionReportWriter()
+                        .write(report, reportDirectory, sourceDir.toString(), baseMemoriesDir.toString());
+                    log.info("Extraction report written to JSON={} and HTML={}", reportPaths.json(), reportPaths.html());
+                    log.info("Extraction summary: scanned={}, extracted={}, duplicates={}, corrupted={}, quarantined={}, failed={}, durationMs={}, rate={}/s",
+                            report.scanned(), report.extracted(), report.duplicates(), report.corrupted(), report.quarantined(), report.failed(),
+                            report.durationMillis(), String.format("%.2f", report.filesPerSecond()));
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.error("Interrupted while waiting for tasks to complete", e);
+            } finally {
+                log.info("Cleaning up temporary extraction files");
+                mediaExtractorService.cleanupTempDir();
+            }
+        } else {
+            log.info("Classifier-only/resume run requested without source directory. Skipping extraction phase and proceeding directly to classification on {}",
+                    baseMemoriesDir);
         }
 
         classifierProcessService.classifyAfterExtraction(
