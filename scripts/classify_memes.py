@@ -17,17 +17,29 @@ Supports:
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
 import re
 import shutil
+import signal
 import sys
 import time
 import unicodedata
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple
+
+sys.path.insert(0, str(Path(__file__).parent))
+from classifier_state import (
+    ClassifierLockError,
+    ClassifierStateStore,
+    LifecycleStatus,
+    compute_file_fingerprint,
+    compute_item_id,
+)
 
 import cv2
 import numpy as np
@@ -983,6 +995,58 @@ def get_unique_destination_path(target_dir: Path, original_name: str) -> Path:
         counter += 1
 
 
+def determine_intended_destination(
+    source_path: Path,
+    category: str,
+    base_memories_dir: Optional[Path] = None,
+    quarantine: bool = False,
+    rescue: bool = False,
+    staged_info: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
+    """Determines the intended destination path before performing routing."""
+    if category == "UNKNOWN":
+        return None
+
+    if staged_info:
+        orig_path = Path(staged_info["original_path"])
+        orig_year = str(staged_info.get("original_year")) if staged_info.get("original_year") else None
+        if not orig_year:
+            orig_year, memories_root = extract_year_and_memories_root(orig_path, base_memories_dir)
+        else:
+            _, memories_root = extract_year_and_memories_root(orig_path, base_memories_dir)
+
+        target_file_name = orig_path.name
+        if category == "PHOTO":
+            return memories_root / orig_year / "photos" / target_file_name
+        elif category == "MEME":
+            dest_dir = memories_root / "quarantine" / orig_year / "memes" if quarantine else memories_root / orig_year / "memes"
+            return dest_dir / target_file_name
+        elif category == "GREETING":
+            dest_dir = memories_root / "quarantine" / orig_year / "greetings" if quarantine else memories_root / orig_year / "greetings"
+            return dest_dir / target_file_name
+        return None
+
+    is_in_quarantine = "quarantine" in source_path.parts
+    if (not rescue) and (not is_in_quarantine) and category == "PHOTO":
+        return None
+
+    year, memories_root = extract_year_and_memories_root(source_path, base_memories_dir)
+    if rescue or is_in_quarantine:
+        if category == "PHOTO":
+            return memories_root / year / "photos" / source_path.name
+        elif category == "MEME":
+            return memories_root / "quarantine" / year / "memes" / source_path.name
+        elif category == "GREETING":
+            return memories_root / "quarantine" / year / "greetings" / source_path.name
+        return None
+    else:
+        target_subfolder = "memes" if category == "MEME" else "greetings"
+        if quarantine:
+            return memories_root / "quarantine" / year / target_subfolder / source_path.name
+        else:
+            return memories_root / year / target_subfolder / source_path.name
+
+
 def route_file(
     source_path: Path,
     category: str,
@@ -1283,6 +1347,20 @@ def main():
                         help="Path to labeled CSV (file_path, expected_category) to evaluate model performance")
     parser.add_argument("--export-uncertain", type=str, default=None,
                         help="Path to export uncertain samples during evaluation for manual review")
+    parser.add_argument("--state-db", type=str, default=None,
+                        help="Path to SQLite progress-state database (default: <source-dir>/.classifier-state/classification.sqlite3)")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Disable progress-state resume (default is resume enabled)")
+    parser.add_argument("--fresh-run", action="store_true",
+                        help="Start fresh run ID without resuming in-flight items, preserving historical items")
+    parser.add_argument("--lease-timeout", type=float, default=300.0,
+                        help="Heartbeat lease timeout in seconds (default: 300.0)")
+    parser.add_argument("--no-reconcile-stale", action="store_true",
+                        help="Disable startup reconciliation of abandoned runs")
+    parser.add_argument("--fingerprint-strategy", choices=["cheap", "full-sha256"], default="cheap",
+                        help="Fingerprint strategy: cheap (stat + head/tail hash) or full-sha256 (default: cheap)")
+    parser.add_argument("--sync-csv", action="store_true",
+                        help="Export/resync full CSV reports from SQLite state store")
 
     args = parser.parse_args()
 
@@ -1324,8 +1402,68 @@ def main():
         print(f"[ERROR] Source directory does not exist: {source_root}")
         sys.exit(1)
 
+    # Initialize SQLite state store
+    if args.state_db:
+        state_db_path = Path(args.state_db).expanduser().resolve()
+    else:
+        state_db_path = (source_root / ".classifier-state" / "classification.sqlite3").resolve()
+
+    cfg_raw = (
+        f"{MODEL_VERSION}:{args.action}:{args.quarantine}:{args.rescue}:"
+        f"{args.threshold}:{args.ambiguity_margin}:{args.review_threshold}:"
+        f"{args.ocr_languages}:{args.device}:{args.model}:"
+        f"{args.no_ocr}:{args.no_clip}:{args.no_gemini}"
+    )
+    config_fingerprint = hashlib.sha256(cfg_raw.encode("utf-8")).hexdigest()[:16]
+    run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+    state_store = ClassifierStateStore(
+        db_path=state_db_path,
+        run_id=run_id,
+        lease_timeout_sec=args.lease_timeout,
+        config_fingerprint=config_fingerprint,
+        model_version=MODEL_VERSION,
+        action=args.action,
+        quarantine=args.quarantine,
+        rescue=args.rescue,
+        command_line=" ".join(sys.argv),
+    )
+
+    try:
+        state_store.acquire_lock()
+    except ClassifierLockError as lock_err:
+        print(f"[ERROR] {lock_err}")
+        sys.exit(1)
+
+    shutdown_requested = False
+
+    def handle_signal(signum, frame):
+        nonlocal shutdown_requested
+        sig_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+        print(f"\n[WARN] Caught {sig_name}; shutting down gracefully after current item/batch...")
+        shutdown_requested = True
+
+    try:
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
+    except Exception:
+        pass
+
+    if not args.no_reconcile_stale:
+        recovered = state_store.recover_stale_runs()
+        if recovered > 0:
+            print(f"[INFO] Recovered {recovered} in-flight items from stale or interrupted runs.")
+
+    # Import legacy CSV if available and state DB is fresh
+    if csv_file.exists():
+        imported = state_store.import_legacy_csv(csv_file)
+        if imported > 0:
+            print(f"[INFO] Imported {imported} historical records from legacy CSV: {csv_file}")
+
     print(f"=== Media Extractor Multi-Modal Classifier ({MODEL_VERSION}) ===")
     print(f"Source Directory:     {source_root}")
+    print(f"State Database:       {state_db_path}")
+    print(f"Resume:               {'DISABLED' if args.no_resume else 'ENABLED'}")
     print(f"Action:               {args.action}")
     print(f"Quarantine Mode:      {'ENABLED' if args.quarantine else 'DISABLED'}")
     print(f"Rescue Mode:          {'ENABLED (quarantine -> photos)' if args.rescue else 'DISABLED'}")
@@ -1336,18 +1474,18 @@ def main():
     print(f"Output CSV:           {csv_file}")
     print(f"Review CSV:           {review_file}")
 
-    # Resume support
-    processed_paths = load_processed_files(csv_file)
-    if processed_paths:
-        print(f"[INFO] Resuming: found {len(processed_paths)} previously processed files in CSV")
-
     # Discover images either from the current-run manifest or the standalone tree scan.
-    image_paths = []
+    resume_enabled = (not args.no_resume) and (not args.fresh_run)
+    image_paths: List[Path] = []
+    item_records: Dict[str, Any] = {}
     staged_metadata: Dict[str, Dict[str, Any]] = {}
+    skipped_count = 0
+
     if args.input_manifest:
         manifest_path = Path(args.input_manifest).expanduser().resolve()
         if not manifest_path.exists():
             print(f"[ERROR] Input manifest does not exist: {manifest_path}")
+            state_store.release_lock(final_status="FAILED", error_message=f"Missing manifest: {manifest_path}")
             sys.exit(1)
         print(f"[INFO] Reading image manifest: {manifest_path}")
         with open(manifest_path, "r", encoding="utf-8") as manifest_file:
@@ -1362,30 +1500,62 @@ def main():
                         orig = Path(data.get("original_path", "")).expanduser().resolve()
                         orig_year = data.get("original_year")
                         if staged.is_file() and staged.suffix.lower() in SUPPORTED_EXTENSIONS:
-                            if str(orig) not in processed_paths and str(staged) not in processed_paths:
-                                image_paths.append(staged)
-                                staged_metadata[str(staged)] = {
-                                    "original_path": orig,
-                                    "original_year": orig_year,
-                                    "triage_category": data.get("triage_category"),
-                                    "triage_reason": data.get("triage_reason"),
-                                }
+                            fp, sz, mt = compute_file_fingerprint(staged, strategy=args.fingerprint_strategy)
+                            # Anchor canonical identity to original_path when available
+                            primary_path = orig if str(orig) else staged
+                            if resume_enabled and (
+                                state_store.is_item_skippable(str(primary_path), fp, config_fingerprint) or
+                                state_store.is_item_skippable(str(staged), fp, config_fingerprint)
+                            ):
+                                skipped_count += 1
+                                continue
+
+                            item_rec = state_store.register_discovered_item(
+                                str(primary_path), fp, sz, mt,
+                                original_path=str(orig),
+                                staged_path=str(staged)
+                            )
+                            image_paths.append(staged)
+                            item_records[str(staged)] = item_rec
+                            staged_metadata[str(staged)] = {
+                                "original_path": orig,
+                                "original_year": orig_year,
+                                "triage_category": data.get("triage_category"),
+                                "triage_reason": data.get("triage_reason"),
+                            }
                         continue
                     except json.JSONDecodeError:
                         pass
-                path = Path(line.rstrip("\r\n")).expanduser()
-                if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS and str(path) not in processed_paths:
+                path = Path(line.rstrip("\r\n")).expanduser().resolve()
+                if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                    fp, sz, mt = compute_file_fingerprint(path, strategy=args.fingerprint_strategy)
+                    if resume_enabled and state_store.is_item_skippable(str(path), fp, config_fingerprint):
+                        skipped_count += 1
+                        continue
+                    item_rec = state_store.register_discovered_item(str(path), fp, sz, mt)
                     image_paths.append(path)
+                    item_records[str(path)] = item_rec
     else:
         print("[INFO] Scanning for image files...")
         for root, _, files in os.walk(source_root):
             if args.rescue and "valid" in Path(root).parts and "quarantine" in Path(root).parts:
                 continue
             for f in files:
-                path = Path(root) / f
+                path = (Path(root) / f).resolve()
                 if path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                    if str(path) not in processed_paths:
-                        image_paths.append(path)
+                    try:
+                        fp, sz, mt = compute_file_fingerprint(path, strategy=args.fingerprint_strategy)
+                    except Exception:
+                        continue
+                    if resume_enabled and state_store.is_item_skippable(str(path), fp, config_fingerprint):
+                        skipped_count += 1
+                        continue
+                    item_rec = state_store.register_discovered_item(str(path), fp, sz, mt)
+                    image_paths.append(path)
+                    item_records[str(path)] = item_rec
+
+    if skipped_count > 0:
+        print(f"[INFO] Resumed: skipped {skipped_count} completed files matching current state and fingerprint.")
 
     if args.limit > 0:
         image_paths = image_paths[:args.limit]
@@ -1394,6 +1564,9 @@ def main():
     print(f"[INFO] Found {total_images} new images to process.")
     if total_images == 0:
         print("[INFO] No pending images found. Done.")
+        state_store.release_lock(final_status="COMPLETED")
+        if args.sync_csv:
+            state_store.export_csv(csv_file, review_file, CSV_HEADER)
         return
 
     # Setup CSV output
@@ -1449,9 +1622,22 @@ def main():
     for i in range(0, total_images, batch_size):
         loaded_items = list(next_chunk_future) if next_chunk_future is not None else []
 
+        # Claim items in state store
+        chunk_item_ids = [
+            item_records[str(loaded["path"])].item_id
+            for loaded in loaded_items
+            if str(loaded["path"]) in item_records
+        ]
+        state_store.transition_items(
+            chunk_item_ids,
+            LifecycleStatus.CLASSIFYING,
+            message="Batch inference in progress",
+            lease_duration_sec=args.lease_timeout,
+        )
+
         # Trigger prefetch for the next batch asynchronously
         next_idx = i + batch_size
-        if next_idx < total_images:
+        if next_idx < total_images and not shutdown_requested:
             next_chunk = image_paths[next_idx:next_idx + batch_size]
             next_chunk_future = io_pool.map(load_item, next_chunk)
         else:
@@ -1576,6 +1762,7 @@ def main():
         # 4. Route files, log to CSV & review queue
         for item in chunk_results:
             img_path = item["path"]
+            item_rec = item_records.get(str(img_path))
             decision = item.get("decision")
             if not decision:
                 category = item.get("category", "UNKNOWN")
@@ -1610,6 +1797,28 @@ def main():
             staged_info = staged_metadata.get(str(img_path))
             logged_file_path = str(staged_info["original_path"]) if staged_info else str(img_path)
 
+            # Determine intended destination
+            intended_dest = None
+            if not needs_review:
+                intended_dest = determine_intended_destination(
+                    img_path, category, source_root,
+                    quarantine=args.quarantine, rescue=args.rescue,
+                    staged_info=staged_info,
+                )
+
+            # Phase 1: Persist result + intended destination in SQLite before moving
+            if item_rec:
+                state_store.persist_classification_result(
+                    item_id=item_rec.item_id,
+                    category=category,
+                    confidence=confidence,
+                    tier=tier,
+                    decision_reason=decision_reason,
+                    uncertainty=uncertainty,
+                    intended_destination=str(intended_dest) if intended_dest else None,
+                    needs_review=needs_review,
+                )
+
             relocated_to = ""
             # In review mode, protect uncertain items: never move/alter them!
             if needs_review:
@@ -1621,7 +1830,13 @@ def main():
                     f"{uncertainty:.4f}", MODEL_VERSION, "", time.strftime("%Y-%m-%d %H:%M:%S")
                 ])
                 review_handle.flush()
+                try:
+                    os.fsync(review_handle.fileno())
+                except Exception:
+                    pass
             else:
+                if item_rec:
+                    state_store.persist_routing_started(item_rec.item_id)
                 try:
                     new_path = route_file(
                         img_path, category, args.action, source_root,
@@ -1630,7 +1845,39 @@ def main():
                     )
                     if new_path:
                         relocated_to = str(new_path)
+                        if item_rec:
+                            state_store.persist_routing_completed(item_rec.item_id, relocated_to)
+                    else:
+                        # route_file returned None: handle staged unknown files and in-place photos
+                        if staged_info:
+                            if category == "UNKNOWN" or tier == "ERROR":
+                                # Safely return unclassifiable staged file back to original location
+                                restored_path = route_file(
+                                    img_path, "PHOTO", args.action, source_root,
+                                    quarantine=args.quarantine, rescue=args.rescue,
+                                    staged_info=staged_info
+                                )
+                                relocated_to = str(restored_path) if restored_path else str(staged_info["original_path"])
+                                if item_rec:
+                                    state_store.mark_failed(item_rec.item_id, f"Unclassifiable image restored to {relocated_to}", retryable=False)
+                            else:
+                                if item_rec:
+                                    state_store.mark_failed(item_rec.item_id, "Could not determine routing destination for staged file", retryable=False)
+                        else:
+                            if category == "PHOTO" and not args.rescue:
+                                relocated_to = str(img_path)
+                                if item_rec:
+                                    state_store.persist_routing_completed(item_rec.item_id, relocated_to)
+                            elif args.action == "dry-run":
+                                relocated_to = ""
+                                if item_rec:
+                                    state_store.persist_routing_completed(item_rec.item_id, relocated_to)
+                            else:
+                                if item_rec:
+                                    state_store.mark_failed(item_rec.item_id, "No destination determined for file", retryable=False)
                 except Exception as e:
+                    if item_rec:
+                        state_store.mark_failed(item_rec.item_id, str(e), retryable=True)
                     decision_reason += f" | Route error: {e}"
 
             stats[tier] = stats.get(tier, 0) + 1
@@ -1645,6 +1892,11 @@ def main():
             ])
 
         csv_handle.flush()
+        try:
+            os.fsync(csv_handle.fileno())
+        except Exception:
+            pass
+
         progress_bar.update(len(loaded_items))
         progress_bar.set_postfix({
             "photos": category_stats.get("PHOTO", 0),
@@ -1653,10 +1905,22 @@ def main():
             "review": stats.get("REVIEW", 0),
         })
 
+        if shutdown_requested:
+            print("\n[INFO] Graceful shutdown requested; checkpointing progress and stopping.")
+            remaining_paths = image_paths[i + batch_size:]
+            remaining_ids = [item_records[str(p)].item_id for p in remaining_paths if str(p) in item_records]
+            state_store.transition_items(remaining_ids, LifecycleStatus.CANCELLED, "Cancelled by user/signal")
+            break
+
     io_pool.shutdown(wait=False)
     csv_handle.close()
     review_handle.close()
     progress_bar.close()
+
+    final_status = "CANCELLED" if shutdown_requested else "COMPLETED"
+    state_store.release_lock(final_status=final_status)
+    if args.sync_csv or resume_enabled:
+        state_store.export_csv(csv_file, review_file, CSV_HEADER)
 
     print(f"\n=== Classification Summary ({MODEL_VERSION}) ===")
     print(f"Total processed: {total_images}")

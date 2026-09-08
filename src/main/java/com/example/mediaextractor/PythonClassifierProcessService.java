@@ -69,6 +69,14 @@ public class PythonClassifierProcessService {
             return;
         }
 
+        boolean recoverStaging = environment.getProperty("media-extractor.classifier-stale-staging-recovery", Boolean.class, true);
+        if (recoverStaging) {
+            int recovered = triageService.recoverStaleStagingDirectories(memoriesDir);
+            if (recovered > 0) {
+                log.info("Startup recovery restored {} orphan staged files from previous runs back to memories", recovered);
+            }
+        }
+
         if (imagePaths.isEmpty()) {
             log.info("Media Extractor classifier enabled, but no images were extracted in this run");
             return;
@@ -248,6 +256,14 @@ public class PythonClassifierProcessService {
         if (environment != null) {
             addOptionalArgument(command, environment, "media-extractor.classifier-output-csv", "--output-csv");
             addOptionalArgument(command, environment, "media-extractor.classifier-review-csv", "--review-csv");
+            addOptionalArgument(command, environment, "media-extractor.classifier-state-db", "--state-db");
+            addOptionalArgument(command, environment, "media-extractor.classifier-fingerprint-strategy", "--fingerprint-strategy");
+            addOptionalArgument(command, environment, "media-extractor.classifier-lease-timeout-seconds", "--lease-timeout");
+
+            boolean resume = environment.getProperty("media-extractor.classifier-resume", Boolean.class, true);
+            if (!resume) {
+                command.add("--no-resume");
+            }
         }
         return command;
     }

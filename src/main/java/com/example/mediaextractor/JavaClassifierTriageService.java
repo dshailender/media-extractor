@@ -7,6 +7,7 @@ import org.springframework.stereotype.Service;
 import javax.imageio.ImageIO;
 import javax.imageio.ImageReader;
 import javax.imageio.stream.ImageInputStream;
+import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -19,6 +20,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
@@ -268,13 +270,24 @@ public class JavaClassifierTriageService {
                         TriageDecision updated = d.withStagedPath(stagedPath);
                         finalDecisions.add(updated);
 
+                        long fileSize = 0L;
+                        long mtimeNs = 0L;
+                        try {
+                            fileSize = Files.size(stagedPath);
+                            mtimeNs = Files.getLastModifiedTime(stagedPath).toInstant().getEpochSecond() * 1_000_000_000L
+                                    + Files.getLastModifiedTime(stagedPath).toInstant().getNano();
+                        } catch (Exception ignored) {
+                        }
+
                         String jsonLine = String.format(
-                                "{\"staged_path\":%s,\"original_path\":%s,\"original_year\":%d,\"triage_category\":%s,\"triage_reason\":%s}%n",
+                                "{\"staged_path\":%s,\"original_path\":%s,\"original_year\":%d,\"triage_category\":%s,\"triage_reason\":%s,\"file_size\":%d,\"mtime_ns\":%d}%n",
                                 jsonQuote(stagedPath.toAbsolutePath().normalize().toString()),
                                 jsonQuote(d.originalPath().toAbsolutePath().normalize().toString()),
                                 d.year(),
                                 jsonQuote(d.category().name()),
-                                jsonQuote(d.reason())
+                                jsonQuote(d.reason()),
+                                fileSize,
+                                mtimeNs
                         );
                         writer.write(jsonLine);
                     }
@@ -325,7 +338,12 @@ public class JavaClassifierTriageService {
                     try {
                         Files.move(staged, dest, StandardCopyOption.ATOMIC_MOVE);
                     } catch (Exception e) {
-                        Files.move(staged, dest, StandardCopyOption.REPLACE_EXISTING);
+                        if (!Files.exists(dest)) {
+                            Files.move(staged, dest);
+                        } else {
+                            dest = getUniqueDestinationPath(dest.getParent(), dest.getFileName().toString());
+                            Files.move(staged, dest);
+                        }
                     }
                     restored++;
                     log.info("Safety restored stranded staged file {} back to {}", staged, dest);
@@ -367,6 +385,230 @@ public class JavaClassifierTriageService {
             } catch (IOException ignored) {
             }
         }
+    }
+
+    /**
+     * Discovers orphan .staging-* directories left by abruptly stopped runs,
+     * reads their manifests, and recovers/restores candidate files safely back
+     * to memories photos directories without overwriting existing files.
+     */
+    public int recoverStaleStagingDirectories(Path baseMemoriesDir) {
+        if (baseMemoriesDir == null || !Files.isDirectory(baseMemoriesDir)) {
+            return 0;
+        }
+
+        int totalRecovered = 0;
+        try (var stream = Files.list(baseMemoriesDir)) {
+            List<Path> stagingDirs = stream
+                    .filter(Files::isDirectory)
+                    .filter(dir -> dir.getFileName().toString().startsWith(".staging-"))
+                    .toList();
+
+            for (Path stagingDir : stagingDirs) {
+                totalRecovered += recoverStaleStagingDirectory(stagingDir, baseMemoriesDir);
+            }
+        } catch (IOException e) {
+            log.error("Failed to scan for stale staging directories in {}: {}", baseMemoriesDir, e.getMessage(), e);
+        }
+
+        return totalRecovered;
+    }
+
+    public int recoverStaleStagingDirectory(Path stagingDir, Path baseMemoriesDir) {
+        if (stagingDir == null || !Files.isDirectory(stagingDir)) {
+            return 0;
+        }
+
+        log.info("Recovering orphan staging directory: {}", stagingDir);
+        Path manifestPath = stagingDir.resolve("manifest.jsonl");
+        int recovered = 0;
+        Set<Path> handledStagedFiles = new java.util.HashSet<>();
+
+        if (Files.exists(manifestPath)) {
+            try (BufferedReader reader = Files.newBufferedReader(manifestPath, StandardCharsets.UTF_8)) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isEmpty() || !line.startsWith("{")) {
+                        continue;
+                    }
+
+                    String stagedStr = extractJsonStringField(line, "staged_path");
+                    String origStr = extractJsonStringField(line, "original_path");
+                    int origYear = extractJsonIntField(line, "original_year", 0);
+
+                    if (stagedStr != null) {
+                        Path stagedPath = Path.of(stagedStr);
+                        if (!Files.exists(stagedPath)) {
+                            stagedPath = stagingDir.resolve(stagedPath.getFileName().toString());
+                        }
+
+                        if (Files.exists(stagedPath)) {
+                            handledStagedFiles.add(stagedPath.toAbsolutePath().normalize());
+                            Path originalPath = origStr != null ? Path.of(origStr) : null;
+                            if (originalPath == null) {
+                                int year = origYear > 0 ? origYear : extractYearFromPhotosPath(stagedPath);
+                                originalPath = baseMemoriesDir.resolve(String.valueOf(year)).resolve("photos").resolve(stagedPath.getFileName().toString());
+                            }
+
+                            safeRestoreFile(stagedPath, originalPath);
+                            recovered++;
+                        }
+                    }
+                }
+            } catch (IOException e) {
+                log.error("Failed to parse manifest {} in stale staging dir: {}", manifestPath, e.getMessage(), e);
+            }
+        }
+
+        // Check for any loose files not handled by manifest
+        try (var fileStream = Files.list(stagingDir)) {
+            List<Path> looseFiles = fileStream
+                    .filter(Files::isRegularFile)
+                    .filter(p -> !p.getFileName().toString().endsWith(".jsonl"))
+                    .filter(p -> !handledStagedFiles.contains(p.toAbsolutePath().normalize()))
+                    .toList();
+
+            for (Path loose : looseFiles) {
+                String name = loose.getFileName().toString();
+                String targetName = name;
+                if (name.length() > 9 && name.charAt(8) == '_') {
+                    targetName = name.substring(9);
+                }
+                int year = extractYearFromPhotosPath(loose);
+                Path dest = baseMemoriesDir.resolve(String.valueOf(year)).resolve("photos").resolve(targetName);
+                safeRestoreFile(loose, dest);
+                recovered++;
+            }
+        } catch (IOException e) {
+            log.error("Error inspecting loose files in {}: {}", stagingDir, e.getMessage(), e);
+        }
+
+        // Cleanup staging directory once files are restored
+        try {
+            Files.deleteIfExists(manifestPath);
+            try (var checkStream = Files.list(stagingDir)) {
+                List<Path> remaining = checkStream.toList();
+                if (remaining.isEmpty()) {
+                    Files.deleteIfExists(stagingDir);
+                    log.info("Safely deleted empty recovered staging directory: {}", stagingDir);
+                } else {
+                    log.warn("Staging directory {} still contains {} items; keeping directory", stagingDir, remaining.size());
+                }
+            }
+        } catch (IOException e) {
+            log.warn("Could not delete staging directory {}: {}", stagingDir, e.getMessage());
+        }
+
+        return recovered;
+    }
+
+    private static void safeRestoreFile(Path source, Path target) {
+        try {
+            if (target.getParent() != null) {
+                Files.createDirectories(target.getParent());
+            }
+            Path dest = target;
+            if (Files.exists(dest)) {
+                if (Files.size(source) == Files.size(dest) && areFileContentsEqual(source, dest)) {
+                    Files.deleteIfExists(source);
+                    return;
+                }
+                dest = getUniqueDestinationPath(target.getParent(), target.getFileName().toString());
+            }
+            try {
+                Files.move(source, dest, StandardCopyOption.ATOMIC_MOVE);
+            } catch (Exception e) {
+                if (!Files.exists(dest)) {
+                    Files.move(source, dest);
+                } else {
+                    dest = getUniqueDestinationPath(dest.getParent(), dest.getFileName().toString());
+                    Files.move(source, dest);
+                }
+            }
+            log.info("Safely restored staged file {} -> {}", source, dest);
+        } catch (IOException e) {
+            log.error("CRITICAL: Failed to restore staged file {}: {}", source, e.getMessage(), e);
+        }
+    }
+
+    public static boolean areFileContentsEqual(Path path1, Path path2) {
+        try {
+            long size1 = Files.size(path1);
+            long size2 = Files.size(path2);
+            if (size1 != size2) {
+                return false;
+            }
+            if (size1 == 0) {
+                return true;
+            }
+            try (var is1 = Files.newInputStream(path1);
+                 var is2 = Files.newInputStream(path2)) {
+                byte[] buf1 = new byte[8192];
+                byte[] buf2 = new byte[8192];
+                int n1;
+                while ((n1 = is1.read(buf1)) > 0) {
+                    int n2 = 0;
+                    while (n2 < n1) {
+                        int r = is2.read(buf2, n2, n1 - n2);
+                        if (r < 0) return false;
+                        n2 += r;
+                    }
+                    if (!Arrays.equals(buf1, 0, n1, buf2, 0, n1)) {
+                        return false;
+                    }
+                }
+                return is2.read() < 0;
+            }
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    static String extractJsonStringField(String json, String field) {
+        int idx = json.indexOf("\"" + field + "\"");
+        if (idx < 0) return null;
+        int colonIdx = json.indexOf(":", idx + field.length() + 2);
+        if (colonIdx < 0) return null;
+        int quoteStart = json.indexOf("\"", colonIdx);
+        if (quoteStart < 0) return null;
+        StringBuilder sb = new StringBuilder();
+        boolean escaped = false;
+        for (int i = quoteStart + 1; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (escaped) {
+                sb.append(c);
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                return sb.toString();
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    static int extractJsonIntField(String json, String field, int defaultValue) {
+        int idx = json.indexOf("\"" + field + "\"");
+        if (idx < 0) return defaultValue;
+        int colonIdx = json.indexOf(":", idx + field.length() + 2);
+        if (colonIdx < 0) return defaultValue;
+        int start = colonIdx + 1;
+        while (start < json.length() && Character.isWhitespace(json.charAt(start))) {
+            start++;
+        }
+        int end = start;
+        while (end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-')) {
+            end++;
+        }
+        if (start < end) {
+            try {
+                return Integer.parseInt(json.substring(start, end));
+            } catch (NumberFormatException ignored) {}
+        }
+        return defaultValue;
     }
 
     /**

@@ -168,6 +168,8 @@ class JavaClassifierTriageServiceTest {
         assertEquals(1, manifestLines.size());
         assertTrue(manifestLines.get(0).contains("meme_stick.png"));
         assertTrue(manifestLines.get(0).contains("NEEDS_PYTHON"));
+        assertTrue(manifestLines.get(0).contains("file_size"));
+        assertTrue(manifestLines.get(0).contains("mtime_ns"));
 
         // Test restoreStrandedFiles safety rollback
         int restored = triageService.restoreStrandedFiles(summary);
@@ -177,6 +179,135 @@ class JavaClassifierTriageServiceTest {
         // Test cleanup
         triageService.cleanupStagingDir(summary);
         assertFalse(Files.exists(summary.stagingDir()), "Staging dir should be deleted after cleanup");
+    }
+
+    @Test
+    void testStaleStagingDiscoveryAndManifestRecovery(@TempDir Path tempDir) throws IOException {
+        Path baseMemories = tempDir.resolve("memories");
+        Path photos2024 = baseMemories.resolve("2024").resolve("photos");
+        Files.createDirectories(photos2024);
+
+        Path orphanStaging = baseMemories.resolve(".staging-20240901_120000_deadbeef");
+        Files.createDirectories(orphanStaging);
+
+        Path stagedFile = orphanStaging.resolve("abcdef12_stranded_meme.png");
+        Files.writeString(stagedFile, "stranded-meme-content");
+
+        Path targetOriginal = photos2024.resolve("stranded_meme.png");
+        Path manifest = orphanStaging.resolve("manifest.jsonl");
+        String jsonLine = String.format(
+                "{\"staged_path\":\"%s\",\"original_path\":\"%s\",\"original_year\":2024,\"triage_category\":\"NEEDS_PYTHON\",\"triage_reason\":\"PNG format\"}%n",
+                stagedFile.toAbsolutePath().normalize().toString().replace("\\", "\\\\"),
+                targetOriginal.toAbsolutePath().normalize().toString().replace("\\", "\\\\")
+        );
+        Files.writeString(manifest, jsonLine);
+
+        int recovered = triageService.recoverStaleStagingDirectories(baseMemories);
+        assertEquals(1, recovered);
+        assertTrue(Files.exists(targetOriginal), "Stranded file must be recovered to original location");
+        assertEquals("stranded-meme-content", Files.readString(targetOriginal));
+        assertFalse(Files.exists(stagedFile), "Staged file must be moved out of staging");
+        assertFalse(Files.exists(orphanStaging), "Staging directory must be deleted once emptied");
+    }
+
+    @Test
+    void testRestorationWithoutOverwritingExistingFiles(@TempDir Path tempDir) throws IOException {
+        Path baseMemories = tempDir.resolve("memories");
+        Path photos2024 = baseMemories.resolve("2024").resolve("photos");
+        Files.createDirectories(photos2024);
+
+        // Pre-existing file at original target path
+        Path targetOriginal = photos2024.resolve("photo.jpg");
+        Files.writeString(targetOriginal, "original-different-content");
+
+        Path orphanStaging = baseMemories.resolve(".staging-20240901_130000_12345678");
+        Files.createDirectories(orphanStaging);
+
+        Path stagedFile = orphanStaging.resolve("87654321_photo.jpg");
+        Files.writeString(stagedFile, "staged-new-content");
+
+        Path manifest = orphanStaging.resolve("manifest.jsonl");
+        String jsonLine = String.format(
+                "{\"staged_path\":\"%s\",\"original_path\":\"%s\",\"original_year\":2024,\"triage_category\":\"NEEDS_PYTHON\",\"triage_reason\":\"Test\"}%n",
+                stagedFile.toAbsolutePath().normalize().toString().replace("\\", "\\\\"),
+                targetOriginal.toAbsolutePath().normalize().toString().replace("\\", "\\\\")
+        );
+        Files.writeString(manifest, jsonLine);
+
+        int recovered = triageService.recoverStaleStagingDirectories(baseMemories);
+        assertEquals(1, recovered);
+
+        // Original file intact
+        assertTrue(Files.exists(targetOriginal));
+        assertEquals("original-different-content", Files.readString(targetOriginal));
+
+        // Restored file given unique non-colliding name
+        Path collisionSafeTarget = photos2024.resolve("photo_1.jpg");
+        assertTrue(Files.exists(collisionSafeTarget), "Collision safe target file should exist");
+        assertEquals("staged-new-content", Files.readString(collisionSafeTarget));
+    }
+
+    @Test
+    void testRecoverStaleStagingWithIdenticalSizeDifferentContentPreserved(@TempDir Path tempDir) throws IOException {
+        Path baseMemories = tempDir.resolve("memories");
+        Path photos2024 = baseMemories.resolve("2024").resolve("photos");
+        Files.createDirectories(photos2024);
+
+        Path orphanStaging = baseMemories.resolve(".staging-20240901_130000_same_sz");
+        Files.createDirectories(orphanStaging);
+
+        // Two files with identical size (24 bytes) but completely different contents
+        Path targetOriginal = photos2024.resolve("same_size.jpg");
+        Files.writeString(targetOriginal, "identical-size-content-A");
+
+        Path stagedFile = orphanStaging.resolve("same_size.jpg");
+        Files.writeString(stagedFile, "identical-size-content-B");
+
+        Path manifest = orphanStaging.resolve("manifest.jsonl");
+        String jsonLine = String.format(
+                "{\"staged_path\":\"%s\",\"original_path\":\"%s\",\"original_year\":2024,\"triage_category\":\"NEEDS_PYTHON\",\"triage_reason\":\"Test\"}%n",
+                stagedFile.toAbsolutePath().normalize().toString().replace("\\", "\\\\"),
+                targetOriginal.toAbsolutePath().normalize().toString().replace("\\", "\\\\")
+        );
+        Files.writeString(manifest, jsonLine);
+
+        int recovered = triageService.recoverStaleStagingDirectories(baseMemories);
+        assertEquals(1, recovered);
+
+        // Target original must not be deleted or overwritten
+        assertTrue(Files.exists(targetOriginal));
+        assertEquals("identical-size-content-A", Files.readString(targetOriginal));
+
+        // Staged file with different content must NOT be deleted; must be restored collision-safe
+        Path collisionSafeTarget = photos2024.resolve("same_size_1.jpg");
+        assertTrue(Files.exists(collisionSafeTarget), "Staged file with different content must be preserved as same_size_1.jpg");
+        assertEquals("identical-size-content-B", Files.readString(collisionSafeTarget));
+    }
+
+    @Test
+    void testCompletedStagedItemsNotRestoredIncorrectly(@TempDir Path tempDir) throws IOException {
+        Path baseMemories = tempDir.resolve("memories");
+        Path photos2024 = baseMemories.resolve("2024").resolve("photos");
+        Files.createDirectories(photos2024);
+
+        Path orphanStaging = baseMemories.resolve(".staging-20240901_140000_routed99");
+        Files.createDirectories(orphanStaging);
+
+        // Staged file was already routed away and no longer exists in staging
+        Path nonExistentStaged = orphanStaging.resolve("missing_staged.png");
+        Path targetOriginal = photos2024.resolve("already_routed.png");
+        Path manifest = orphanStaging.resolve("manifest.jsonl");
+        String jsonLine = String.format(
+                "{\"staged_path\":\"%s\",\"original_path\":\"%s\",\"original_year\":2024,\"triage_category\":\"NEEDS_PYTHON\",\"triage_reason\":\"Already Routed\"}%n",
+                nonExistentStaged.toAbsolutePath().normalize().toString().replace("\\", "\\\\"),
+                targetOriginal.toAbsolutePath().normalize().toString().replace("\\", "\\\\")
+        );
+        Files.writeString(manifest, jsonLine);
+
+        int recovered = triageService.recoverStaleStagingDirectories(baseMemories);
+        assertEquals(0, recovered);
+        assertFalse(Files.exists(targetOriginal), "Non-existent staged file must not create bogus destination");
+        assertFalse(Files.exists(orphanStaging), "Empty orphan staging directory should be cleaned up");
     }
 
     private byte[] createJpegWithExifCameraTags(int width, int height, String make, String model, String software) throws IOException {

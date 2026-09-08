@@ -462,7 +462,87 @@ class TestClassifier(unittest.TestCase):
         self.assertTrue(staged_dry.exists())
         self.assertFalse(orig_dry.exists())
 
+    def test_cli_state_db_and_resume(self):
+        photos_dir = self.test_dir / "2024" / "photos"
+        photos_dir.mkdir(parents=True)
+        img_path = photos_dir / "camera_img.jpg"
+        Image.new("RGB", (100, 100), color="green").save(img_path)
+
+        state_db = self.test_dir / "test_state.sqlite3"
+        out_csv = self.test_dir / "test_out.csv"
+        rev_csv = self.test_dir / "test_rev.csv"
+
+        # Run 1: initial processing
+        cmd = [
+            sys.executable,
+            str(Path(__file__).with_name("classify_memes.py")),
+            "--source-dir", str(self.test_dir),
+            "--state-db", str(state_db),
+            "--output-csv", str(out_csv),
+            "--review-csv", str(rev_csv),
+            "--no-ocr", "--no-clip", "--no-gemini",
+        ]
+        res1 = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        self.assertEqual(res1.returncode, 0, res1.stderr + res1.stdout)
+        self.assertTrue(state_db.exists(), "State database should have been created")
+
+        # Run 2: resume should skip unchanged completed file
+        res2 = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        self.assertEqual(res2.returncode, 0, res2.stderr + res2.stdout)
+        self.assertIn("skipped 1 completed files", res2.stdout)
+
+    def test_staged_unclassifiable_image_not_marked_completed_at_empty_dest(self):
+        """Verify that a corrupted or unclassifiable staged image is not marked COMPLETED with empty destination."""
+        staging_dir = self.test_dir / ".staging-test-corrupt"
+        staging_dir.mkdir(parents=True)
+        corrupt_staged = staging_dir / "bad_image.jpg"
+        corrupt_staged.write_bytes(b"not-a-valid-jpeg")
+
+        photos_dir = self.test_dir / "2024" / "photos"
+        photos_dir.mkdir(parents=True, exist_ok=True)
+        original_target = photos_dir / "bad_image.jpg"
+
+        manifest_path = staging_dir / "manifest.jsonl"
+        manifest_path.write_text(
+            json.dumps({
+                "staged_path": str(corrupt_staged),
+                "original_path": str(original_target),
+                "original_year": 2024,
+                "triage_category": "NEEDS_PYTHON",
+                "triage_reason": "Corrupt test"
+            }) + "\n",
+            encoding="utf-8"
+        )
+
+        state_db = self.test_dir / "test_corrupt_state.sqlite3"
+        out_csv = self.test_dir / "corrupt_out.csv"
+        rev_csv = self.test_dir / "corrupt_rev.csv"
+        cmd = [
+            sys.executable,
+            str(Path(__file__).with_name("classify_memes.py")),
+            "--source-dir", str(self.test_dir),
+            "--input-manifest", str(manifest_path),
+            "--state-db", str(state_db),
+            "--output-csv", str(out_csv),
+            "--review-csv", str(rev_csv),
+            "--no-ocr", "--no-clip", "--no-gemini",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+
+        # Connect to state_db and check item status
+        import sqlite3
+        conn = sqlite3.connect(str(state_db))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM classifier_items WHERE canonical_path LIKE '%bad_image.jpg';").fetchone()
+        self.assertIsNotNone(row)
+        # Should NOT be COMPLETED at ""
+        self.assertNotEqual(row["status"], "COMPLETED")
+        self.assertEqual(row["status"], "FAILED_PERMANENT")
+        conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

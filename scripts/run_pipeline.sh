@@ -34,6 +34,8 @@ if [ -z "${SOURCE_DIR}" ]; then
     echo "  --dry-run         Run classifier in audit mode without moving memes/greetings"
     echo "  --no-classify     Skip Python classification entirely"
     echo "  --no-quarantine   Move memes/greetings to ~/memories/{YYYY}/ instead of quarantine"
+    echo "  --no-resume       Disable resume and reprocess all files"
+    echo "  --state-db=<path> Custom SQLite state database location"
     echo ""
     echo "Example:"
     echo "  $0 /path/to/backup"
@@ -53,5 +55,27 @@ echo "Action:          move (default)"
 echo "Quarantine:      ~/memories/quarantine/{YYYY}/ (default)"
 echo "=========================================================="
 
-java -jar "${JAR_FILE}" "${SOURCE_DIR}" "$@"
+EXTRA_ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-resume)
+            EXTRA_ARGS+=("--media-extractor.classifier-resume=false")
+            shift
+            ;;
+        --state-db=*)
+            EXTRA_ARGS+=("--media-extractor.classifier-state-db=${1#*=}")
+            shift
+            ;;
+        --state-db)
+            EXTRA_ARGS+=("--media-extractor.classifier-state-db=$2")
+            shift 2
+            ;;
+        *)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+java -jar "${JAR_FILE}" "${SOURCE_DIR}" "${EXTRA_ARGS[@]}"
 

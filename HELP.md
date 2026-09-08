@@ -19,22 +19,41 @@ While most of the inheritance is fine, it also inherits unwanted elements like `
 To prevent this, the project POM contains empty overrides for these elements.
 If you manually switch to a different parent and actually want the inheritance, you need to remove those overrides.
 
-### Use below command to run the application
+### Running the Application
+
+The recommended way to run Media Extractor is using the unified pipeline runner script:
 
 ```bash
-# Unified extraction + classification + move to quarantine (Default):
-java -jar target/media-extractor-0.0.1-SNAPSHOT.jar [<sourceDir>]
-
-# Or use the convenience script:
-./scripts/run_pipeline.sh /path/to/source
+# Recommended: Unified extraction, Java triage, and AI classification runner
+./scripts/run_pipeline.sh <source_directory> [options]
 ```
 
-**Arguments & Shorthand Flags:**
-- `<sourceDir>` (optional): Source directory containing media and archives. Defaults to `C:\Users\Shailender\projects\backup`
-- `--dry-run`: Runs classifier in audit mode (inspects and logs without moving memes/greetings).
-- `--no-classify`: Skips the Python classifier entirely (pure extraction only).
-- `--no-quarantine`: Moves memes/greetings to `~/memories/{YYYY}/` instead of `~/memories/quarantine/{YYYY}/`.
-- `--sanitize` or `--clean`: Runs in sanitization mode to audit existing files in `~/memories/`, quarantines any corrupted files, removes duplicates, and prunes empty directories without performing a new source extraction.
+The `run_pipeline.sh` script automatically:
+1. **Verifies the Python environment**: Creates `.venv` and installs multi-modal dependencies via `./scripts/setup_env.sh` if not already present.
+2. **Builds the application JAR**: Automatically packages `target/media-extractor-0.0.1-SNAPSHOT.jar` via `./mvnw package -DskipTests` if needed.
+3. **Executes the full pipeline**: Extracts media into `~/memories/{YYYY}/`, performs instant Java camera triage, and runs multi-modal classification to quarantine memes and greetings.
+
+Alternatively, you can run the pre-built JAR directly:
+```bash
+java -jar target/media-extractor-0.0.1-SNAPSHOT.jar <source_directory> [options]
+```
+
+**Command-Line Flags & Options:**
+- `<source_directory>`: Source directory containing media files, folders, or nested archives.
+- `--mode=<mode>`: Classifier execution and triage mode:
+  - `java-triage-python` (*default*): Uses Java virtual threads for sub-millisecond EXIF/header inspection to certify obvious camera photos into `~/memories/{YYYY}/photos/` (bypassing Python), while safely staging candidate images for deep Python CLIP/OCR/Gemini classification.
+  - `python`: Bypasses Java triage and evaluates all extracted images directly in Python.
+  - `java-only`: Runs only fast Java-level camera triage without launching the Python process.
+  - `disabled`: Skips classification entirely (equivalent to `--no-classify`).
+- `--dry-run`: Runs classifier in audit mode without moving or altering any files (logs decisions to CSV and console).
+- `--move` (*default*): Moves classified memes and greetings into target directories.
+- `--copy`: Copies memes and greetings to target directories instead of moving them.
+- `--quarantine` (*default*): Routes memes and greetings into `~/memories/quarantine/{YYYY}/`.
+- `--no-quarantine`: Routes memes and greetings directly into `~/memories/{YYYY}/memes/` and `~/memories/{YYYY}/greetings/`.
+- `--no-classify`: Skips the classification stage entirely (performs pure media extraction and deduplication).
+- `--no-resume`: Disables progress-state resume and forces re-evaluation of all candidate images.
+- `--state-db=<path>`: Specifies custom path for the SQLite progress-state database (default: `~/memories/.classifier-state/classification.sqlite3`).
+- `--sanitize` or `--clean`: Runs in sanitization mode to audit existing files in `~/memories/`, quarantines corrupted files, removes duplicates, and prunes empty directories without performing a new source extraction.
 
 **Output Directory Structure:**
 
@@ -102,22 +121,51 @@ Reports are named `media-extraction-report-<timestamp>.json` and `.html`. They i
 
 ### Examples
 
-Extract media with default source directory:
+**1. Full Pipeline (Extract + Java Triage + Python AI Classification + Quarantine):**
 ```bash
-java -jar target/media-extractor-0.0.1-SNAPSHOT.jar
+# Recommended runner (builds JAR and virtual environment automatically)
+./scripts/run_pipeline.sh /path/to/backup
+
+# Or using the built JAR directly:
+java -jar target/media-extractor-0.0.1-SNAPSHOT.jar /path/to/backup
 ```
 
-Extract from custom source directory:
+**2. Dry-Run Audit Mode (Classify & log without moving files):**
 ```bash
-java -jar target/media-extractor-0.0.1-SNAPSHOT.jar /home/user/MyPhotos
+./scripts/run_pipeline.sh /path/to/backup --dry-run
 ```
 
-Audit and sanitize existing memories (quarantine corrupt files, prune empty folders):
+**3. Ultra-Fast Java-Only Triage (Header/EXIF certification without spawning Python):**
+```bash
+./scripts/run_pipeline.sh /path/to/backup --mode=java-only
+```
+
+**4. Pure Extraction Only (Skip AI classification sidecar):**
+```bash
+./scripts/run_pipeline.sh /path/to/backup --no-classify
+```
+
+**5. In-Place Organization (Route memes/greetings without quarantine directory):**
+```bash
+./scripts/run_pipeline.sh /path/to/backup --no-quarantine
+```
+
+**6. Force Full Re-evaluation (Disable resume and re-evaluate all images):**
+```bash
+./scripts/run_pipeline.sh /path/to/backup --no-resume
+```
+
+**7. Custom SQLite Progress-State Database:**
+```bash
+./scripts/run_pipeline.sh /path/to/backup --state-db=/custom/path/classification.sqlite3
+```
+
+**8. Audit & Sanitize Existing Memories (Quarantine corrupt files, prune duplicates):**
 ```bash
 java -jar target/media-extractor-0.0.1-SNAPSHOT.jar --sanitize
 ```
 
-On Windows:
+**9. Windows PowerShell / CMD:**
 ```bash
 java -jar target/media-extractor-0.0.1-SNAPSHOT.jar C:\Users\YourName\Pictures
 ```
@@ -188,12 +236,28 @@ media-extractor.classifier-working-directory=.
 - `disabled`: Skips classification entirely.
 
 **CLI Overrides:**
-- `--mode=java-triage-python`, `--mode=python`, `--mode=disabled`
+- `--mode=java-triage-python`, `--mode=python`, `--mode=java-only`, `--mode=disabled`
 - `--classify`, `--no-classify`
 - `--move`, `--copy`, `--dry-run`
 - `--quarantine`, `--no-quarantine`
+- `--no-resume` (forces full re-evaluation without skipping previously completed items)
+- `--state-db=<path>` (sets custom SQLite progress-state database path)
 
 - By default, action is `move` and quarantine is `true`, routing memes and greetings directly into `~/memories/quarantine/{YYYY}/`.
 - Use `--dry-run` to inspect without moving, or `--no-classify` to disable the classifier.
+- When running via `./scripts/run_pipeline.sh`, all flags are accepted and forwarded automatically.
 - Automatic classification is skipped for `--sanitize`/`--clean`, the `test` profile, and runs that extract no photos. Python startup failures, nonzero exit codes, and timeouts are logged while the completed Java extraction remains successful. Staged files are automatically restored on failure.
+
+### Crash-Safe, Resumable Progress-State System
+
+Classification progress is authoritatively managed in a durable SQLite database (default: `~/memories/.classifier-state/classification.sqlite3`).
+
+**Key Reliability Features:**
+- **Authoritative SQLite State**: Uses WAL journal mode, busy timeouts, and atomic multi-statement transactions.
+- **Two-Phase Commit**: Classification decisions and intended destinations are durably persisted *before* filesystem routing occurs. Interrupted moves are reconciled automatically on restart.
+- **Cheap Fingerprinting**: Files are identified via canonical path, size, nanosecond modification time, and sparse head/tail SHA-256 hash. Modified files are detected and reprocessed; unchanged completed files are skipped.
+- **Single-Process Lock & Lease Management**: Prevents concurrent classifier runs on the same database. Stale runs (dead PIDs or expired heartbeat leases) are safely claimed and in-flight items recovered.
+- **Orphan Staging Recovery**: Java triage scans for abandoned `.staging-*` directories on startup, reconciling staged files with manifests and safely restoring them without overwriting user data.
+- **Graceful Cancellation**: Handles `SIGINT` (Ctrl+C) and `SIGTERM`, stopping cleanly after the active batch, checkpointing progress, and flushing metadata.
+- **Report Consistency**: `classification_results.csv` and `review_queue.csv` are synced and fsynced atomically with no duplicate rows during resumes.
 
