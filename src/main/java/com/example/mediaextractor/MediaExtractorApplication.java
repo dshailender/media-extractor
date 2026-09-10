@@ -53,51 +53,19 @@ public class MediaExtractorApplication implements CommandLineRunner {
         mediaExtractorService.getMetadataService().setPhotoPrefix(photoPrefix);
         mediaExtractorService.getMetadataService().setVideoPrefix(videoPrefix);
 
-        boolean sanitizeMode = false;
-        Boolean classifierEnabledOverride = null;
-        String classifierActionOverride = null;
-        Boolean classifierQuarantineOverride = null;
-        String classifierModeOverride = null;
-        String sourceArgument = null;
+        ParsedArguments parsed = parseArguments(args);
+        boolean sanitizeMode = parsed.sanitizeMode();
+        boolean classifyOnly = parsed.classifyOnly();
+        Boolean classifierEnabledOverride = parsed.classifierEnabledOverride();
+        String classifierActionOverride = parsed.classifierActionOverride();
+        Boolean classifierQuarantineOverride = parsed.classifierQuarantineOverride();
+        String classifierModeOverride = parsed.classifierModeOverride();
+        String sourceArgument = parsed.sourceArgument();
+        String outputArgument = parsed.outputArgument();
 
-        for (int i = 0; i < args.length; i++) {
-            String arg = args[i];
-            String lower = arg.toLowerCase();
-            if (lower.equals("--sanitize") || lower.equals("--clean")) {
-                sanitizeMode = true;
-            } else if (lower.startsWith("--mode=")) {
-                classifierModeOverride = arg.substring("--mode=".length()).trim();
-            } else if (lower.equals("--mode") && i + 1 < args.length) {
-                classifierModeOverride = args[++i].trim();
-            } else if (lower.equals("--classify") || lower.equals("--resume")) {
-                classifierEnabledOverride = true;
-            } else if (lower.equals("--no-classify")) {
-                classifierEnabledOverride = false;
-            } else if (lower.equals("--move") || lower.equals("--action=move")) {
-                classifierEnabledOverride = true;
-                classifierActionOverride = "move";
-            } else if (lower.equals("--dry-run") || lower.equals("--action=dry-run")) {
-                classifierEnabledOverride = true;
-                classifierActionOverride = "dry-run";
-            } else if (lower.equals("--copy") || lower.equals("--action=copy")) {
-                classifierEnabledOverride = true;
-                classifierActionOverride = "copy";
-            } else if (lower.startsWith("--action=")) {
-                classifierEnabledOverride = true;
-                classifierActionOverride = arg.substring("--action=".length()).trim();
-            } else if (lower.equals("--action") && i + 1 < args.length) {
-                classifierEnabledOverride = true;
-                classifierActionOverride = args[++i].trim();
-            } else if (lower.equals("--quarantine") || lower.equals("--quarantine-memes")) {
-                classifierQuarantineOverride = true;
-            } else if (lower.equals("--no-quarantine")) {
-                classifierQuarantineOverride = false;
-            } else if (!arg.startsWith("--") && sourceArgument == null) {
-                sourceArgument = arg;
-            }
-        }
-
-        Path baseMemoriesDir = Path.of(System.getProperty("user.home")).resolve("memories").toAbsolutePath().normalize();
+        String configuredOutputDir = environment.getProperty("media-extractor.output-directory",
+                environment.getProperty("media-extractor.output-dir", ""));
+        Path baseMemoriesDir = resolveOutputDirectory(outputArgument, configuredOutputDir);
 
         if (sanitizeMode) {
             log.info("Sanitization mode requested. Sanitizing existing memories at {}", baseMemoriesDir);
@@ -110,10 +78,10 @@ public class MediaExtractorApplication implements CommandLineRunner {
         Files.createDirectories(baseMemoriesDir);
         log.info("Base output directory ready at {}", baseMemoriesDir);
 
-        boolean shouldExtract = sourceArgument != null || !Boolean.TRUE.equals(classifierEnabledOverride);
+        boolean shouldExtract = !classifyOnly && !sanitizeMode && (sourceArgument != null || !Boolean.TRUE.equals(classifierEnabledOverride));
         Path sourceDir = null;
         if (sourceArgument != null) {
-            sourceDir = Path.of(sourceArgument).toAbsolutePath().normalize();
+            sourceDir = expandUserHome(sourceArgument).toAbsolutePath().normalize();
         } else if (shouldExtract) {
             sourceDir = Path.of("C:\\Users\\Shailender\\projects\\backup").toAbsolutePath().normalize();
         }
@@ -133,7 +101,7 @@ public class MediaExtractorApplication implements CommandLineRunner {
             String configuredReportDirectory = environment.getProperty("media-extractor.report-directory", "");
             Path reportDirectory = configuredReportDirectory.isBlank()
                 ? baseMemoriesDir
-                : Path.of(configuredReportDirectory).toAbsolutePath().normalize();
+                : expandUserHome(configuredReportDirectory).toAbsolutePath().normalize();
 
             ExecutorService configuredExecutor = configuredThreads > 0
                 ? Executors.newFixedThreadPool(configuredThreads)
@@ -176,7 +144,7 @@ public class MediaExtractorApplication implements CommandLineRunner {
                 mediaExtractorService.cleanupTempDir();
             }
         } else {
-            log.info("Classifier-only/resume run requested without source directory. Skipping extraction phase and proceeding directly to classification on {}",
+            log.info("Classifier-only run requested (--classify). Skipping extraction phase and proceeding directly to classification on {}",
                     baseMemoriesDir);
         }
 
@@ -192,5 +160,135 @@ public class MediaExtractorApplication implements CommandLineRunner {
             ));
 
         log.info("Media extraction workflow completed");
+    }
+
+    public record ParsedArguments(
+        boolean sanitizeMode,
+        boolean classifyOnly,
+        Boolean classifierEnabledOverride,
+        String classifierActionOverride,
+        Boolean classifierQuarantineOverride,
+        String classifierModeOverride,
+        String sourceArgument,
+        String outputArgument
+    ) {}
+
+    public static ParsedArguments parseArguments(String... args) {
+        boolean sanitizeMode = false;
+        boolean classifyOnly = false;
+        Boolean classifierEnabledOverride = null;
+        String classifierActionOverride = null;
+        Boolean classifierQuarantineOverride = null;
+        String classifierModeOverride = null;
+        String sourceArgument = null;
+        String outputArgument = null;
+
+        if (args != null) {
+            for (int i = 0; i < args.length; i++) {
+                String arg = args[i];
+                if (arg == null || arg.isBlank()) {
+                    continue;
+                }
+                String lower = arg.toLowerCase();
+                if (lower.equals("--sanitize") || lower.equals("--clean")) {
+                    sanitizeMode = true;
+                } else if (lower.startsWith("--mode=")) {
+                    classifierModeOverride = arg.substring("--mode=".length()).trim();
+                } else if (lower.equals("--mode") && i + 1 < args.length) {
+                    classifierModeOverride = args[++i].trim();
+                } else if (lower.equals("--classify") || lower.equals("--classify-only") || lower.equals("--resume")) {
+                    classifyOnly = true;
+                    classifierEnabledOverride = true;
+                } else if (lower.equals("--no-classify")) {
+                    classifierEnabledOverride = false;
+                    classifyOnly = false;
+                } else if (lower.equals("--move") || lower.equals("--action=move")) {
+                    classifierEnabledOverride = true;
+                    classifierActionOverride = "move";
+                } else if (lower.equals("--dry-run") || lower.equals("--action=dry-run")) {
+                    classifierEnabledOverride = true;
+                    classifierActionOverride = "dry-run";
+                } else if (lower.equals("--copy") || lower.equals("--action=copy")) {
+                    classifierEnabledOverride = true;
+                    classifierActionOverride = "copy";
+                } else if (lower.startsWith("--action=")) {
+                    classifierEnabledOverride = true;
+                    classifierActionOverride = arg.substring("--action=".length()).trim();
+                } else if (lower.equals("--action") && i + 1 < args.length) {
+                    classifierEnabledOverride = true;
+                    classifierActionOverride = args[++i].trim();
+                } else if (lower.equals("--quarantine") || lower.equals("--quarantine-memes")) {
+                    classifierQuarantineOverride = true;
+                } else if (lower.equals("--no-quarantine")) {
+                    classifierQuarantineOverride = false;
+                } else if (lower.startsWith("--output=")) {
+                    outputArgument = arg.substring("--output=".length()).trim();
+                } else if (lower.equals("--output") && i + 1 < args.length) {
+                    outputArgument = args[++i].trim();
+                } else if (lower.startsWith("--output-dir=")) {
+                    outputArgument = arg.substring("--output-dir=".length()).trim();
+                } else if (lower.equals("--output-dir") && i + 1 < args.length) {
+                    outputArgument = args[++i].trim();
+                } else if (lower.startsWith("-o=")) {
+                    outputArgument = arg.substring("-o=".length()).trim();
+                } else if (lower.equals("-o") && i + 1 < args.length) {
+                    outputArgument = args[++i].trim();
+                } else if (!arg.startsWith("-")) {
+                    if (sourceArgument == null) {
+                        sourceArgument = arg;
+                    } else if (outputArgument == null) {
+                        outputArgument = arg;
+                    }
+                }
+            }
+        }
+
+        if (classifyOnly) {
+            if (outputArgument == null && sourceArgument != null) {
+                outputArgument = sourceArgument;
+            }
+            sourceArgument = null;
+        }
+
+        return new ParsedArguments(
+            sanitizeMode,
+            classifyOnly,
+            classifierEnabledOverride,
+            classifierActionOverride,
+            classifierQuarantineOverride,
+            classifierModeOverride,
+            sourceArgument,
+            outputArgument
+        );
+    }
+
+    public static Path resolveOutputDirectory(String outputArgument, String configuredProperty) {
+        String rawPath = null;
+        if (outputArgument != null && !outputArgument.isBlank()) {
+            rawPath = outputArgument.trim();
+        } else if (configuredProperty != null && !configuredProperty.isBlank()) {
+            rawPath = configuredProperty.trim();
+        }
+
+        if (rawPath == null || rawPath.isBlank()) {
+            return Path.of(System.getProperty("user.home")).resolve("memories").toAbsolutePath().normalize();
+        }
+
+        return expandUserHome(rawPath).toAbsolutePath().normalize();
+    }
+
+    public static Path expandUserHome(String pathStr) {
+        if (pathStr == null || pathStr.isBlank()) {
+            return Path.of(System.getProperty("user.home"));
+        }
+        String trimmed = pathStr.trim();
+        String userHome = System.getProperty("user.home");
+        if (trimmed.equals("~")) {
+            return Path.of(userHome);
+        }
+        if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+            return Path.of(userHome).resolve(trimmed.substring(2));
+        }
+        return Path.of(trimmed);
     }
 }

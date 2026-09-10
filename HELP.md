@@ -25,21 +25,22 @@ The recommended way to run Media Extractor is using the unified pipeline runner 
 
 ```bash
 # Recommended: Unified extraction, Java triage, and AI classification runner
-./scripts/run_pipeline.sh <source_directory> [options]
+./scripts/run_pipeline.sh <source_directory> [output_directory] [options]
 ```
 
 The `run_pipeline.sh` script automatically:
 1. **Verifies the Python environment**: Creates `.venv` and installs multi-modal dependencies via `./scripts/setup_env.sh` if not already present.
 2. **Builds the application JAR**: Automatically packages `target/media-extractor-0.0.1-SNAPSHOT.jar` via `./mvnw package -DskipTests` if needed.
-3. **Executes the full pipeline**: Extracts media into `~/memories/{YYYY}/`, performs instant Java camera triage, and runs multi-modal classification to quarantine memes and greetings.
+3. **Executes the full pipeline**: Extracts media into `{output_directory}/{YYYY}/` (default: `~/memories/{YYYY}/`), performs instant Java camera triage, and runs multi-modal classification to quarantine memes and greetings.
 
 Alternatively, you can run the pre-built JAR directly:
 ```bash
-java -jar target/media-extractor-0.0.1-SNAPSHOT.jar <source_directory> [options]
+java -jar target/media-extractor-0.0.1-SNAPSHOT.jar <source_directory> [output_directory] [options]
 ```
 
 **Command-Line Flags & Options:**
 - `<source_directory>`: Source directory containing media files, folders, or nested archives.
+- `[output_directory]` / `-o <dir>` / `--output=<dir>` / `--output-dir=<dir>`: Output base directory (default: `~/memories`). Can be supplied as a flag or as an optional second positional argument. Supports tilde expansion (`~/...` to user home).
 - `--mode=<mode>`: Classifier execution and triage mode:
   - `java-triage-python` (*default*): Uses Java virtual threads for sub-millisecond EXIF/header inspection to certify obvious camera photos into `~/memories/{YYYY}/photos/` (bypassing Python), while safely staging candidate images for deep Python CLIP/OCR/Gemini classification.
   - `python`: Bypasses Java triage and evaluates all extracted images directly in Python.
@@ -49,7 +50,8 @@ java -jar target/media-extractor-0.0.1-SNAPSHOT.jar <source_directory> [options]
 - `--move` (*default*): Moves classified memes and greetings into target directories.
 - `--copy`: Copies memes and greetings to target directories instead of moving them.
 - `--quarantine` (*default*): Routes memes and greetings into `~/memories/quarantine/{YYYY}/`.
-- `--no-quarantine`: Routes memes and greetings directly into `~/memories/{YYYY}/memes/` and `~/memories/{YYYY}/greetings/`.
+- `--classify` (or `--classify-only`): Runs in classify-only mode to evaluate and organize extracted media already in the output directory (`~/memories/{YYYY}/photos/` by default or specified via `--output` / positional directory) without performing a new source extraction.
+- `--resume`: Resumes classification on existing memories directory (equivalent to `--classify`).
 - `--no-classify`: Skips the classification stage entirely (performs pure media extraction and deduplication).
 - `--no-resume`: Disables progress-state resume and forces re-evaluation of all candidate images.
 - `--state-db=<path>`: Specifies custom path for the SQLite progress-state database (default: `~/memories/.classifier-state/classification.sqlite3`).
@@ -111,11 +113,12 @@ media-extractor.threads=0
 media-extractor.max-in-flight=256
 media-extractor.progress-interval-ms=5000
 media-extractor.report-directory=
+media-extractor.output-directory=
 media-extractor.quarantine-enabled=true
 media-extractor.preserve-timestamps=true
 ```
 
-`media-extractor.threads=0` uses virtual threads. Set it to a positive value to use a fixed-size pool. `media-extractor.max-in-flight` bounds pending and active extraction work so scanning large backups does not create an unbounded task queue. `media-extractor.quarantine-enabled` controls whether corrupted files are safely isolated in `~/memories/quarantine/` (default `true`). `media-extractor.preserve-timestamps` sets the destination file's filesystem modified time to the extracted capture date (default `true`). Progress is logged periodically and includes scanned, completed, in-flight, extracted, duplicate, corrupt, quarantined, failed, and rate metrics.
+`media-extractor.threads=0` uses virtual threads. Set it to a positive value to use a fixed-size pool. `media-extractor.max-in-flight` bounds pending and active extraction work so scanning large backups does not create an unbounded task queue. `media-extractor.output-directory` configures the default base output directory (defaults to `~/memories` if blank). `media-extractor.quarantine-enabled` controls whether corrupted files are safely isolated in `{output}/quarantine/` (default `true`). `media-extractor.preserve-timestamps` sets the destination file's filesystem modified time to the extracted capture date (default `true`). Progress is logged periodically and includes scanned, completed, in-flight, extracted, duplicate, corrupt, quarantined, failed, and rate metrics.
 
 Reports are named `media-extraction-report-<timestamp>.json` and `.html`. They include source/output paths, timing, throughput, bytes written, peak in-flight work, per-type/year extraction counts, and item-level duplicate/corruption/failure details. Set `media-extractor.report-directory` to place them elsewhere.
 
@@ -165,7 +168,20 @@ java -jar target/media-extractor-0.0.1-SNAPSHOT.jar /path/to/backup
 java -jar target/media-extractor-0.0.1-SNAPSHOT.jar --sanitize
 ```
 
-**9. Windows PowerShell / CMD:**
+**9. Classify Only (Classify existing extracted media without re-extracting):**
+```bash
+# In default output directory (~/memories):
+./scripts/run_pipeline.sh --classify
+# Or with pre-built JAR:
+java -jar target/media-extractor-0.0.1-SNAPSHOT.jar --classify
+
+# In custom output directory:
+./scripts/run_pipeline.sh --classify /path/to/output
+# Or with pre-built JAR:
+java -jar target/media-extractor-0.0.1-SNAPSHOT.jar --classify /path/to/output
+```
+
+**10. Windows PowerShell / CMD:**
 ```bash
 java -jar target/media-extractor-0.0.1-SNAPSHOT.jar C:\Users\YourName\Pictures
 ```

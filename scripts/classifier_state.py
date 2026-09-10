@@ -1364,6 +1364,8 @@ class ClassifierStateStore:
                     d for d in dirs
                     if not d.startswith(".")
                     and not d.startswith(".staging-")
+                    and not d.startswith("$")
+                    and d.lower() not in ("$recycle.bin", "system volume information", "recovery", "config.msi", "msocache", "$winreagent", "$sysreset")
                     and d != ".classifier-state"
                     and d.lower() != "videos"
                     and d.lower() != "review"
@@ -1553,6 +1555,8 @@ def main():
     args = parser.parse_args()
 
     db_path = Path(args.state_db) if args.state_db else None
+    if db_path is None and hasattr(args, "source_dir") and args.source_dir:
+        db_path = (Path(args.source_dir) / ".classifier-state" / "classification.sqlite3").resolve()
     state_store = ClassifierStateStore(db_path=db_path)
 
     if args.command == "discover":

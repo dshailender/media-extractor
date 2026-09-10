@@ -20,6 +20,7 @@ import java.time.ZoneId;
 import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -673,5 +674,82 @@ class MediaExtractorServiceTest {
         // Date string at offset 44 from TIFF start
         payload.write(ascii);
         return payload.toByteArray();
+    }
+
+    @Test
+    void testTraverseSkipsSystemAndRecycleDirectories() throws IOException, InterruptedException {
+        Path sourceDir = tempRoot.resolve("source-with-system-dirs");
+        Files.createDirectories(sourceDir);
+
+        // Valid photo in a normal subdirectory
+        Path normalSub = sourceDir.resolve("normal_folder");
+        Files.createDirectories(normalSub);
+        Files.write(normalSub.resolve("valid.jpg"), createSimpleJpeg());
+
+        // Windows recycle bin directory with user SID subfolder
+        Path recycleBin = sourceDir.resolve("$RECYCLE.BIN").resolve("S-1-5-21-1140719149-3503213194-3878720672-1001");
+        Files.createDirectories(recycleBin);
+        Files.write(recycleBin.resolve("deleted_photo.jpg"), createSimpleJpeg());
+
+        // Windows system volume directory
+        Path sysVolume = sourceDir.resolve("System Volume Information");
+        Files.createDirectories(sysVolume);
+        Files.write(sysVolume.resolve("sys_photo.jpg"), createSimpleJpeg());
+
+        // macOS / Linux trash
+        Path trashDir = sourceDir.resolve(".Trash-1000");
+        Files.createDirectories(trashDir);
+        Files.write(trashDir.resolve("trash_photo.jpg"), createSimpleJpeg());
+
+        service.extractMedia(sourceDir, baseMemoriesDir);
+        executor.shutdown();
+        assertTrue(executor.awaitTermination(60, TimeUnit.SECONDS));
+
+        // Verify only valid.jpg was extracted (count = 1)
+        int currentYear = LocalDateTime.now().getYear();
+        Path photosDir = baseMemoriesDir.resolve(String.valueOf(currentYear)).resolve("photos");
+        assertTrue(Files.exists(photosDir));
+        try (var stream = Files.list(photosDir)) {
+            var extracted = stream.toList();
+            assertEquals(1, extracted.size(), "Only the valid photo should be extracted; system/recycle directories must be skipped");
+        }
+    }
+
+    @Test
+    void testTraverseHandlesAccessDeniedGracefully() throws IOException, InterruptedException {
+        Path sourceDir = tempRoot.resolve("source-with-restricted");
+        Files.createDirectories(sourceDir);
+
+        // Valid photo in a normal directory
+        Path normalSub = sourceDir.resolve("readable");
+        Files.createDirectories(normalSub);
+        Files.write(normalSub.resolve("readable.jpg"), createSimpleJpeg());
+
+        // Create an unreadable directory to simulate permission denied
+        Path restrictedDir = sourceDir.resolve("restricted");
+        Files.createDirectories(restrictedDir);
+        Files.write(restrictedDir.resolve("hidden.jpg"), createSimpleJpeg());
+
+        boolean chmodSuccess = restrictedDir.toFile().setReadable(false) && restrictedDir.toFile().setExecutable(false);
+        try {
+            service.extractMedia(sourceDir, baseMemoriesDir);
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(60, TimeUnit.SECONDS));
+
+            // Must not fail traversal, and readable.jpg must be extracted
+            int currentYear = LocalDateTime.now().getYear();
+            Path photosDir = baseMemoriesDir.resolve(String.valueOf(currentYear)).resolve("photos");
+            assertTrue(Files.exists(photosDir));
+            try (var stream = Files.list(photosDir)) {
+                var extracted = stream.toList();
+                assertEquals(1, extracted.size(), "Readable photo must be extracted even if a sibling directory is inaccessible");
+            }
+        } finally {
+            // Restore permissions for test cleanup
+            if (chmodSuccess) {
+                restrictedDir.toFile().setReadable(true);
+                restrictedDir.toFile().setExecutable(true);
+            }
+        }
     }
 }

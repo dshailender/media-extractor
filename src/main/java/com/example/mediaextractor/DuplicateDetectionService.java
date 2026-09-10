@@ -64,10 +64,19 @@ public class DuplicateDetectionService {
             Files.walkFileTree(baseMemoriesDir, new SimpleFileVisitor<>() {
                 @Override
                 public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
-                    if (dir.getFileName() != null && dir.getFileName().toString().equalsIgnoreCase("quarantine")) {
-                        return FileVisitResult.SKIP_SUBTREE;
+                    if (dir.getFileName() != null) {
+                        String name = dir.getFileName().toString();
+                        if (name.equalsIgnoreCase("quarantine") || MediaExtractorService.isSystemOrRecycleDirectory(dir)) {
+                            return FileVisitResult.SKIP_SUBTREE;
+                        }
                     }
                     return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                    log.warn("Skipping inaccessible path during deduplication indexing: {} ({})", file, exc.getMessage());
+                    return FileVisitResult.SKIP_SUBTREE;
                 }
 
                 @Override
