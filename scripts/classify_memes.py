@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import time
 import unicodedata
@@ -997,6 +998,110 @@ def get_unique_destination_path(target_dir: Path, original_name: str) -> Path:
         counter += 1
 
 
+def create_windows_shortcut(target_path: Path, shortcut_path: Path) -> bool:
+    """Creates a Windows .lnk Shell Shortcut using PowerShell/WScript.Shell."""
+    if sys.platform != "win32":
+        return False
+    try:
+        target_str = str(target_path.resolve()).replace("'", "''")
+        shortcut_str = str(shortcut_path.resolve()).replace("'", "''")
+        ps_cmd = (
+            f"$ws = New-Object -ComObject WScript.Shell; "
+            f"$s = $ws.CreateShortcut('{shortcut_str}'); "
+            f"$s.TargetPath = '{target_str}'; "
+            f"$s.Save()"
+        )
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return res.returncode == 0 and shortcut_path.exists()
+    except Exception:
+        return False
+
+
+def create_review_link(
+    original_path: Path,
+    memories_root: Path,
+    year: str,
+    link_type: str = "auto"
+) -> Optional[Path]:
+    """
+    Creates a shortcut or link to the original file in:
+    memories_root / "quarantine" / year / "review" / original_path.name
+
+    - link_type="auto": Relative symbolic link on POSIX; on Windows tries symlink and falls back to .lnk/.url.
+    - link_type="symlink": Creates a symbolic link.
+    - link_type="shortcut": On Windows, creates a .lnk (or .url) shortcut; on POSIX falls back to symlink.
+    """
+    try:
+        original_path = Path(original_path)
+        review_dir = memories_root / "quarantine" / year / "review"
+        review_dir.mkdir(parents=True, exist_ok=True)
+
+        if link_type == "shortcut" and sys.platform == "win32":
+            link_name = f"{original_path.name}.lnk"
+        else:
+            link_name = original_path.name
+
+        link_path = review_dir / link_name
+
+        # Check existing link/shortcut for idempotency
+        if os.path.islink(link_path):
+            try:
+                raw_target = os.readlink(link_path)
+                target_p = Path(raw_target)
+                resolved_target = (link_path.parent / target_p).resolve() if not target_p.is_absolute() else target_p.resolve()
+                if resolved_target == original_path.resolve():
+                    return link_path
+            except Exception:
+                pass
+            try:
+                os.unlink(link_path)
+            except Exception:
+                pass
+        elif link_path.exists():
+            if link_type == "shortcut" or link_path.suffix.lower() in (".lnk", ".url"):
+                return link_path
+            link_path = get_unique_destination_path(review_dir, link_name)
+
+        # Attempt symlink if auto or symlink (or non-win32)
+        if link_type in ("auto", "symlink") or sys.platform != "win32":
+            try:
+                try:
+                    rel_target = os.path.relpath(original_path, review_dir)
+                except ValueError:
+                    rel_target = str(original_path)
+                os.symlink(rel_target, link_path)
+                return link_path
+            except OSError as e:
+                if link_type == "symlink" or sys.platform != "win32":
+                    print(f"[WARN] Could not create review symlink at {link_path}: {e}")
+                    return None
+
+        # Shortcut creation for Windows
+        shortcut_path = review_dir / f"{original_path.name}.lnk"
+        if create_windows_shortcut(original_path, shortcut_path):
+            return shortcut_path
+
+        # Fallback: InternetShortcut (.url) natively opened by Windows Explorer
+        url_path = review_dir / f"{original_path.name}.url"
+        try:
+            with open(url_path, "w", encoding="utf-8") as f:
+                f.write(f"[InternetShortcut]\nURL=file:///{original_path.resolve().as_posix()}\n")
+            return url_path
+        except Exception as err:
+            print(f"[WARN] Failed to create review shortcut for {original_path}: {err}")
+            return None
+
+    except Exception as e:
+        print(f"[WARN] Failed to create review link for {original_path}: {e}")
+        return None
+
+
 def determine_intended_destination(
     source_path: Path,
     category: str,
@@ -1006,7 +1111,7 @@ def determine_intended_destination(
     staged_info: Optional[Dict[str, Any]] = None,
 ) -> Optional[Path]:
     """Determines the intended destination path before performing routing."""
-    if category == "UNKNOWN":
+    if category == "UNKNOWN" or "review" in source_path.parts:
         return None
 
     if staged_info:
@@ -1073,7 +1178,7 @@ def route_file(
         MEME     -> ~/memories/quarantine/{YYYY}/memes/ (if quarantine=True) or ~/memories/{YYYY}/memes/
         GREETING -> ~/memories/quarantine/{YYYY}/greetings/ (if quarantine=True) or ~/memories/{YYYY}/greetings/
     """
-    if category == "UNKNOWN":
+    if category == "UNKNOWN" or "review" in source_path.parts:
         return None
 
     if staged_info:
@@ -1329,6 +1434,12 @@ def main():
                         help="Uncertainty threshold above which items are routed to review queue (default: 0.40)")
     parser.add_argument("--review-csv", type=str, default="review_queue.csv",
                         help="Path to review queue CSV for uncertain cases (default: review_queue.csv)")
+    parser.add_argument("--create-review-links", dest="create_review_links", action="store_true", default=True,
+                        help="Create shortcuts/symlinks for review items in ~/memories/quarantine/{YYYY}/review (default: True)")
+    parser.add_argument("--no-review-links", dest="create_review_links", action="store_false",
+                        help="Disable creating shortcuts/symlinks for review items")
+    parser.add_argument("--review-link-type", choices=["auto", "symlink", "shortcut"], default="auto",
+                        help="Review link type: auto (symlink on Unix, fallback on Windows), symlink, or shortcut (default: auto)")
     parser.add_argument("--device", type=str, default="cpu",
                         help="Device for local CLIP inference: cpu or cuda (default: cpu)")
     parser.add_argument("--model", type=str, default="gemini-3.6-flash",
@@ -1845,6 +1956,25 @@ def main():
             # In review mode, protect uncertain items: never move/alter them!
             if needs_review:
                 stats["REVIEW"] += 1
+                if getattr(args, "create_review_links", True):
+                    try:
+                        orig_p = Path(logged_file_path)
+                        item_year = str(staged_info.get("original_year")) if staged_info and staged_info.get("original_year") else None
+                        if not item_year:
+                            item_year, item_root = extract_year_and_memories_root(orig_p, source_root)
+                        else:
+                            _, item_root = extract_year_and_memories_root(orig_p, source_root)
+                        created_link = create_review_link(
+                            original_path=orig_p,
+                            memories_root=item_root,
+                            year=item_year,
+                            link_type=getattr(args, "review_link_type", "auto"),
+                        )
+                        if created_link:
+                            stats["REVIEW_LINKS"] = stats.get("REVIEW_LINKS", 0) + 1
+                    except Exception as e:
+                        print(f"[WARN] Failed to create review link for {logged_file_path}: {e}")
+
                 review_writer.writerow([
                     logged_file_path, category, f"{confidence:.4f}", tier, decision_reason,
                     ocr_text_clean, f"{ocr_conf:.4f}", text_box_count, f"{text_area_ratio:.4f}",
@@ -1952,6 +2082,8 @@ def main():
     print(f"Results log:     {csv_file}")
     if stats.get("REVIEW", 0) > 0:
         print(f"Review log:      {review_file}")
+        if stats.get("REVIEW_LINKS", 0) > 0:
+            print(f"Review links:    {stats.get('REVIEW_LINKS', 0)} links created in ~/memories/quarantine/{{YYYY}}/review/")
 
 
 if __name__ == "__main__":

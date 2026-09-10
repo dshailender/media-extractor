@@ -308,6 +308,12 @@ public class PythonClassifierProcessService {
             if (!resume) {
                 command.add("--no-resume");
             }
+
+            boolean createReviewLinks = environment.getProperty("media-extractor.classifier-create-review-links", Boolean.class, true);
+            if (!createReviewLinks) {
+                command.add("--no-review-links");
+            }
+            addOptionalArgument(command, environment, "media-extractor.classifier-review-link-type", "--review-link-type");
         }
         return command;
     }

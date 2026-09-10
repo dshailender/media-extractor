@@ -51,6 +51,7 @@ from classify_memes import (
     get_unique_destination_path,
     load_processed_files,
     route_file,
+    create_review_link,
 )
 
 
@@ -540,6 +541,93 @@ class TestClassifier(unittest.TestCase):
         self.assertNotEqual(row["status"], "COMPLETED")
         self.assertEqual(row["status"], "FAILED_PERMANENT")
         conn.close()
+
+    def test_create_review_link(self):
+        memories_root = self.test_dir / "memories"
+        photo_dir = memories_root / "2024" / "photos"
+        photo_dir.mkdir(parents=True, exist_ok=True)
+        photo_path = photo_dir / "review_sample.jpg"
+        photo_path.write_bytes(b"sample_image_data")
+
+        # 1. Test symlink creation
+        link_path = create_review_link(photo_path, memories_root, "2024", link_type="symlink")
+        self.assertIsNotNone(link_path)
+        self.assertTrue(link_path.is_symlink() or link_path.exists())
+        expected_dir = memories_root / "quarantine" / "2024" / "review"
+        self.assertEqual(link_path.parent.resolve(), expected_dir.resolve())
+        self.assertEqual(link_path.name, "review_sample.jpg")
+
+        # Verify link resolves to original photo
+        self.assertEqual(link_path.resolve(), photo_path.resolve())
+
+        # 2. Test idempotency
+        link_path_again = create_review_link(photo_path, memories_root, "2024", link_type="symlink")
+        self.assertEqual(link_path, link_path_again)
+
+    def test_review_mode_creates_link_and_preserves_photo(self):
+        memories_root = self.test_dir / "memories"
+        photo_dir = memories_root / "2024" / "photos"
+        photo_dir.mkdir(parents=True, exist_ok=True)
+        photo_path = photo_dir / "uncertain_meme.png"
+
+        # Create image with text that triggers uncertainty / needs_review
+        img = Image.new("RGB", (300, 300), color="white")
+        draw = ImageDraw.Draw(img)
+        draw.text((30, 30), "Some uncertain text caption here", fill="black")
+        img.save(photo_path)
+
+        state_db = self.test_dir / "review_state.sqlite3"
+        out_csv = self.test_dir / "out.csv"
+        rev_csv = self.test_dir / "rev.csv"
+
+        # Run with low review-threshold to guarantee review mode
+        cmd = [
+            sys.executable,
+            str(Path(__file__).with_name("classify_memes.py")),
+            "--source-dir", str(memories_root),
+            "--state-db", str(state_db),
+            "--output-csv", str(out_csv),
+            "--review-csv", str(rev_csv),
+            "--review-threshold", "0.01",
+            "--create-review-links",
+            "--action", "move",
+            "--quarantine",
+            "--no-clip", "--no-gemini",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+
+        # Original photo must still exist in photos/ (untouched)
+        self.assertTrue(photo_path.exists())
+
+        # Check review link was created in quarantine/2024/review
+        review_link = memories_root / "quarantine" / "2024" / "review" / "uncertain_meme.png"
+        self.assertTrue(review_link.exists() or review_link.is_symlink())
+        self.assertEqual(review_link.resolve(), photo_path.resolve())
+
+        # Check review_csv contains the file
+        self.assertTrue(rev_csv.exists())
+        with rev_csv.open(encoding="utf-8") as f:
+            content = f.read()
+            self.assertIn("uncertain_meme.png", content)
+
+    def test_rescue_mode_ignores_review_dir(self):
+        from classifier_state import ClassifierStateStore
+        memories_root = self.test_dir / "memories"
+        review_dir = memories_root / "quarantine" / "2024" / "review"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        review_photo = review_dir / "reviewed.jpg"
+        review_photo.write_bytes(b"dummy")
+
+        store = ClassifierStateStore(self.test_dir / "dummy_state.sqlite3")
+        summary = store.discover_candidates(
+            source_dir=memories_root,
+            resume_enabled=False,
+            rescue=True,
+        )
+        # Should not include files in quarantine/.../review
+        for cand in summary.candidate_paths:
+            self.assertNotIn("review", Path(cand).parts)
 
 
 if __name__ == "__main__":

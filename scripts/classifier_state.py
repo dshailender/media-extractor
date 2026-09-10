@@ -1366,6 +1366,7 @@ class ClassifierStateStore:
                     and not d.startswith(".staging-")
                     and d != ".classifier-state"
                     and d.lower() != "videos"
+                    and d.lower() != "review"
                     and (rescue or d != "quarantine")
                 ]
                 for f in files:

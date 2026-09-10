@@ -69,6 +69,31 @@ class PythonClassifierProcessServiceTest {
     }
 
     @Test
+    void testBuildCommandWithReviewLinkOptions() {
+        Path python = Path.of(".venv/bin/python");
+        Path script = Path.of("scripts/classify_memes.py");
+        Path memoriesDir = Path.of("/home/user/memories");
+        Path manifest = Path.of("/tmp/test.manifest");
+
+        MockEnvironment envDefault = new MockEnvironment();
+        List<String> cmdDefault = PythonClassifierProcessService.buildCommand(
+                python, script, memoriesDir, manifest, "move", true, envDefault
+        );
+        assertFalse(cmdDefault.contains("--no-review-links"));
+        assertFalse(cmdDefault.contains("--review-link-type"));
+
+        MockEnvironment envCustom = new MockEnvironment();
+        envCustom.setProperty("media-extractor.classifier-create-review-links", "false");
+        envCustom.setProperty("media-extractor.classifier-review-link-type", "shortcut");
+        List<String> cmdCustom = PythonClassifierProcessService.buildCommand(
+                python, script, memoriesDir, manifest, "move", true, envCustom
+        );
+        assertTrue(cmdCustom.contains("--no-review-links"));
+        assertTrue(cmdCustom.contains("--review-link-type"));
+        assertTrue(cmdCustom.contains("shortcut"));
+    }
+
+    @Test
     void testClassifierOptionsDefaultsAndOverrides() {
         PythonClassifierProcessService.ClassifierOptions defaults = PythonClassifierProcessService.ClassifierOptions.defaults();
         assertFalse(Boolean.TRUE.equals(defaults.enabledOverride()));
