@@ -629,6 +629,106 @@ class TestClassifier(unittest.TestCase):
         for cand in summary.candidate_paths:
             self.assertNotIn("review", Path(cand).parts)
 
+    def test_load_rgb_image_detached_memory_and_resize(self):
+        img_path = self.test_dir / "test_normal.jpg"
+        img = Image.new("RGB", (600, 400), color=(120, 80, 200))
+        img.save(img_path, quality=90)
+
+        loaded = ImagePreprocessor.load_rgb_image(img_path)
+        self.assertIsNone(getattr(loaded, "fp", None))
+        # Ensure resizing works cleanly without 'assert self.fp is not None'
+        resized = loaded.resize((200, 150))
+        self.assertEqual(resized.size, (200, 150))
+
+    def test_load_rgb_image_truncated_jpeg(self):
+        img_path = self.test_dir / "test_truncated.jpg"
+        img = Image.new("RGB", (800, 600), color=(50, 100, 150))
+        img.save(img_path, quality=90)
+
+        data = img_path.read_bytes()
+        img_path.write_bytes(data[:int(len(data) * 0.8)])
+
+        loaded = ImagePreprocessor.load_rgb_image(img_path)
+        self.assertIsNotNone(loaded)
+        resized = loaded.resize((400, 300))
+        self.assertEqual(resized.size, (400, 300))
+
+    def test_load_rgb_image_corrupted_file_raises(self):
+        bad_path = self.test_dir / "completely_corrupted.jpg"
+        bad_path.write_bytes(b"INVALID DATA THAT IS NOT AN IMAGE")
+
+        with self.assertRaises(Exception):
+            ImagePreprocessor.load_rgb_image(bad_path)
+
+    def test_clip_classify_batch_fallback_diagnostics(self):
+        classifier = LocalClipEnsembleClassifier()
+        classifier._load_model()
+        orig_processor = classifier._processor
+        try:
+            class FailingProcessor:
+                def __call__(self, *args, **kwargs):
+                    raise AssertionError("Simulated closed fp assertion")
+
+            classifier._processor = FailingProcessor()
+            img = Image.new("RGB", (100, 100), color=(0, 0, 0))
+            results = classifier.classify_batch([img])
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["top_label"], "PHOTO")
+            self.assertIn("Simulated closed fp assertion", results[0]["details"])
+        finally:
+            classifier._processor = orig_processor
+
+    def test_staged_file_restored_on_unknown_in_route_file(self):
+        memories_root = self.test_dir / "memories"
+        staging_dir = memories_root / ".staging-test"
+        staging_dir.mkdir(parents=True)
+        staged_file = staging_dir / "abc_candidate.jpg"
+        staged_file.write_bytes(b"dummy image content")
+        orig_file = memories_root / "2024" / "photos" / "candidate.jpg"
+
+        staged_info = {
+            "staged_path": str(staged_file),
+            "original_path": str(orig_file),
+            "original_year": 2024,
+        }
+
+        # route_file returns None for UNKNOWN
+        routed = route_file(
+            source_path=staged_file,
+            category="UNKNOWN",
+            action="move",
+            base_memories_dir=memories_root,
+            staged_info=staged_info,
+        )
+        self.assertIsNone(routed)
+
+        # But fallback restoring as PHOTO moves it back to original photo location
+        restored = route_file(
+            source_path=staged_file,
+            category="PHOTO",
+            action="move",
+            base_memories_dir=memories_root,
+            staged_info=staged_info,
+        )
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.resolve(), orig_file.resolve())
+        self.assertTrue(orig_file.exists())
+        self.assertFalse(staged_file.exists())
+
+    def test_create_review_link_resolves_to_valid_file(self):
+        memories_root = self.test_dir / "memories"
+        photo_dir = memories_root / "2024" / "photos"
+        photo_dir.mkdir(parents=True, exist_ok=True)
+        photo_path = photo_dir / "my_review_photo.jpg"
+        photo_path.write_bytes(b"image data")
+
+        link = create_review_link(photo_path, memories_root, "2024", link_type="symlink")
+        self.assertIsNotNone(link)
+        self.assertTrue(link.exists())
+        self.assertTrue(os.path.islink(link))
+        # Ensure it resolves directly to the photo file
+        self.assertEqual(link.resolve(), photo_path.resolve())
+
 
 if __name__ == "__main__":
     unittest.main()

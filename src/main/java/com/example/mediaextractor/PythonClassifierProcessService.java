@@ -167,8 +167,21 @@ public class PythonClassifierProcessService {
         int maxConcurrency = environment.getProperty("media-extractor.classifier-max-concurrency", Integer.class, 256);
         JavaClassifierTriageService.TriageSummary triageSummary = null;
         Process process = null;
+        Thread shutdownHook = null;
         try {
             triageSummary = triageService.triageAndStage(imagePaths, memoriesDir, action, maxConcurrency);
+            final JavaClassifierTriageService.TriageSummary finalSummary = triageSummary;
+            shutdownHook = new Thread(() -> {
+                if (finalSummary != null) {
+                    try {
+                        triageService.restoreStrandedFiles(finalSummary);
+                        triageService.cleanupStagingDir(finalSummary);
+                    } catch (Exception ignored) {
+                    }
+                }
+            }, "classifier-staging-recovery-hook");
+            Runtime.getRuntime().addShutdownHook(shutdownHook);
+
             if (triageSummary.certifiedPhotos() > 0) {
                 recordCertifiedPhotos(triageSummary, python, workingDirectory, environment);
             }
@@ -214,6 +227,13 @@ public class PythonClassifierProcessService {
             Thread.currentThread().interrupt();
             log.error("Interrupted while waiting for Python classifier");
         } finally {
+            if (shutdownHook != null) {
+                try {
+                    Runtime.getRuntime().removeShutdownHook(shutdownHook);
+                } catch (IllegalStateException ignored) {
+                    // JVM already shutting down
+                }
+            }
             if (triageSummary != null) {
                 int restored = triageService.restoreStrandedFiles(triageSummary);
                 if (restored > 0) {

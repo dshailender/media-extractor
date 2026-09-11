@@ -46,7 +46,8 @@ from classifier_state import (
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps, ImageFilter, ExifTags
+from PIL import Image, ImageOps, ImageFilter, ExifTags, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from tqdm import tqdm
 
 import torch
@@ -160,6 +161,8 @@ class ImagePreprocessor:
         """
         Loads an image file, applies EXIF orientation transpose, converts to RGB,
         and bounds maximum dimension to max_dim to avoid excessive CPU/memory load.
+        Guarantees that the image pixel buffer is fully loaded in memory and detached
+        from any underlying file stream.
         """
         with Image.open(image_path) as raw_img:
             w, h = raw_img.size
@@ -171,6 +174,7 @@ class ImagePreprocessor:
                     raw_img.draft("RGB", target_size)
                 except Exception:
                     pass
+            raw_img.load()
             oriented = ImagePreprocessor.correct_orientation(raw_img)
             rgb = ImagePreprocessor.safe_convert_rgb(oriented)
             if max(rgb.size) > max_dim:
@@ -178,6 +182,10 @@ class ImagePreprocessor:
                 new_w = max(1, int(rgb.size[0] * scale))
                 new_h = max(1, int(rgb.size[1] * scale))
                 rgb = rgb.resize((new_w, new_h), Image.Resampling.BILINEAR)
+            else:
+                rgb.load()
+                if rgb is raw_img or getattr(rgb, "fp", None) is not None:
+                    rgb = rgb.copy()
             return rgb
 
     @classmethod
@@ -300,15 +308,23 @@ class EasyOcrEngine:
 
         # Scale down for OCR if image is large: 800px max dimension provides 2.5x faster
         # CRAFT text detection while capturing all meme captions, greetings, and screenshots.
-        ocr_scale = 1.0
-        max_dim = max(orig_w, orig_h)
-        if max_dim > 800:
-            ocr_scale = 800.0 / max_dim
-            norm_rgb_for_ocr = norm_rgb.resize((int(orig_w * ocr_scale), int(orig_h * ocr_scale)), Image.Resampling.BILINEAR)
-        else:
+        try:
+            ocr_scale = 1.0
+            max_dim = max(orig_w, orig_h)
+            if max_dim > 800:
+                ocr_scale = 800.0 / max_dim
+                norm_rgb_for_ocr = norm_rgb.resize((int(orig_w * ocr_scale), int(orig_h * ocr_scale)), Image.Resampling.BILINEAR)
+            else:
+                norm_rgb_for_ocr = norm_rgb
+        except Exception as e:
+            print(f"[WARN] Failed resizing image for OCR ({image_path}): {repr(e)}")
             norm_rgb_for_ocr = norm_rgb
 
-        variants = ImagePreprocessor.generate_ocr_variants(norm_rgb_for_ocr)
+        try:
+            variants = ImagePreprocessor.generate_ocr_variants(norm_rgb_for_ocr)
+        except Exception as e:
+            print(f"[WARN] Failed generating OCR variants ({image_path}): {repr(e)}")
+            return default_result
         all_detections: List[Tuple[List, str, float]] = []
         seen_texts: Set[str] = set()
 
@@ -590,14 +606,20 @@ class LocalClipEnsembleClassifier:
                 logits = torch.matmul(img_embeds, self._text_weights.t()) * logit_scale
                 probs_matrix = logits.softmax(dim=-1).cpu().numpy()
         except Exception as e:
-            print(f"[WARN] CLIP ensemble inference error: {e}")
+            print(f"[WARN] CLIP ensemble inference error: {repr(e)}")
+            if len(pil_images) > 1:
+                # Fall back to single-image inference so one bad image does not degrade entire batch
+                fallback_results = []
+                for single_img in pil_images:
+                    fallback_results.extend(self.classify_batch([single_img]))
+                return fallback_results
             return [{
                 "top_label": "PHOTO",
                 "confidence": 0.5,
                 "margin": 0.0,
                 "entropy": 1.0,
                 "scores": {"PHOTO": 0.34, "MEME": 0.33, "GREETING": 0.33},
-                "details": f"Inference error: {e}",
+                "details": f"Inference error: {repr(e)}",
             } for _ in pil_images]
 
         output = []
@@ -1826,48 +1848,61 @@ def main():
             has_camera_exif = it["has_camera_exif"]
             clip_data = it["clip_data"] or {}
 
-            # Layout check
-            w, h = pil_rgb.size
-            aspect_ratio = float(w) / float(max(h, 1))
-            is_screenshot_ratio = (
-                (0.45 <= aspect_ratio <= 0.60) or
-                (1.65 <= aspect_ratio <= 2.25)
-            )
+            try:
+                # Layout check
+                w, h = pil_rgb.size
+                aspect_ratio = float(w) / float(max(h, 1))
+                is_screenshot_ratio = (
+                    (0.45 <= aspect_ratio <= 0.60) or
+                    (1.65 <= aspect_ratio <= 2.25)
+                )
 
-            # Cascaded bypass: Unambiguous camera photos skip heavy OCR
-            skip_ocr = (
-                has_camera_exif and
-                clip_data.get("top_label") == "PHOTO" and
-                clip_data.get("confidence", 0.0) >= 0.85 and
-                not is_screenshot_ratio
-            )
+                # Cascaded bypass: Unambiguous camera photos skip heavy OCR
+                skip_ocr = (
+                    has_camera_exif and
+                    clip_data.get("top_label") == "PHOTO" and
+                    clip_data.get("confidence", 0.0) >= 0.85 and
+                    not is_screenshot_ratio
+                )
 
-            if ocr_enabled and not skip_ocr:
-                ocr_data = ocr_engine.extract_features(img_path, pil_rgb, has_camera_exif=has_camera_exif)
-            else:
-                ocr_data = {
-                    "ocr_text": "",
-                    "ocr_confidence": 0.0,
-                    "text_box_count": 0,
-                    "text_area_ratio": 0.0,
-                    "boxes": [],
-                    "top_band_count": 0,
-                    "bottom_band_count": 0,
+                if ocr_enabled and not skip_ocr:
+                    ocr_data = ocr_engine.extract_features(img_path, pil_rgb, has_camera_exif=has_camera_exif)
+                else:
+                    ocr_data = {
+                        "ocr_text": "",
+                        "ocr_confidence": 0.0,
+                        "text_box_count": 0,
+                        "text_area_ratio": 0.0,
+                        "boxes": [],
+                        "top_band_count": 0,
+                        "bottom_band_count": 0,
+                    }
+                it["ocr_data"] = ocr_data
+
+                signals = signal_extractor.extract_signals(pil_rgb, ocr_data, has_camera_exif)
+                it["signals"] = signals
+
+                decision = HierarchicalDecisionEngine.decide(
+                    has_camera_exif,
+                    it["camera_info"],
+                    ocr_data,
+                    signals,
+                    clip_data,
+                    review_threshold=args.review_threshold,
+                )
+                it["decision"] = decision
+            except Exception as e:
+                print(f"[WARN] Error analyzing {img_path}: {repr(e)}")
+                it["ocr_data"] = {}
+                it["signals"] = {}
+                it["decision"] = {
+                    "category": "UNKNOWN",
+                    "confidence": 0.0,
+                    "tier": "ERROR",
+                    "decision_reason": f"Analysis error: {repr(e)}",
+                    "uncertainty": 1.0,
+                    "needs_review": False,
                 }
-            it["ocr_data"] = ocr_data
-
-            signals = signal_extractor.extract_signals(pil_rgb, ocr_data, has_camera_exif)
-            it["signals"] = signals
-
-            decision = HierarchicalDecisionEngine.decide(
-                has_camera_exif,
-                it["camera_info"],
-                ocr_data,
-                signals,
-                clip_data,
-                review_threshold=args.review_threshold,
-            )
-            it["decision"] = decision
 
         # 3. Gemini Fallback for high uncertainty items
         for item in chunk_results:
@@ -1953,9 +1988,21 @@ def main():
                 )
 
             relocated_to = ""
-            # In review mode, protect uncertain items: never move/alter them!
+            # In review mode, protect uncertain items: keep them in photos/
             if needs_review:
                 stats["REVIEW"] += 1
+                if staged_info and args.action != "dry-run":
+                    # If this file was staged by Java triage, restore it back to its original location in photos/
+                    orig_target = Path(staged_info["original_path"])
+                    if img_path.exists() and img_path.resolve() != orig_target.resolve():
+                        orig_target.parent.mkdir(parents=True, exist_ok=True)
+                        dest_file = orig_target
+                        if dest_file.exists():
+                            if dest_file.stat().st_size != img_path.stat().st_size:
+                                dest_file = get_unique_destination_path(orig_target.parent, orig_target.name)
+                        shutil.move(str(img_path), str(dest_file))
+                        logged_file_path = str(dest_file)
+
                 if getattr(args, "create_review_links", True):
                     try:
                         orig_p = Path(logged_file_path)
