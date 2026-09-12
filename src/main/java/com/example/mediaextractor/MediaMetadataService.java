@@ -273,6 +273,185 @@ public class MediaMetadataService {
         return null;
     }
 
+    public record CameraExifInfo(
+            String make,
+            String model,
+            String software,
+            int orientation,
+            String lensModel
+    ) {
+        public boolean hasCameraHardware() {
+            return (make != null && !make.isBlank()) || (model != null && !model.isBlank());
+        }
+
+        public String deviceDescription() {
+            String m = make != null ? make.trim() : "";
+            String mo = model != null ? model.trim() : "";
+            String desc = (m + " " + mo).trim();
+            if (desc.isEmpty() && lensModel != null && !lensModel.isBlank()) {
+                return "Lens: " + lensModel.trim();
+            }
+            return desc.isEmpty() ? null : desc;
+        }
+    }
+
+    /**
+     * Extracts camera hardware metadata (Make, Model, Orientation, Software, Lens)
+     * by streaming the leading 128KB of image headers.
+     */
+    public CameraExifInfo extractCameraExif(Path file) {
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
+            int bufferSize = (int) Math.min(channel.size(), 131072);
+            if (bufferSize < 10) {
+                return null;
+            }
+
+            ByteBuffer buffer = ByteBuffer.allocate(bufferSize);
+            channel.read(buffer);
+            byte[] bytes = buffer.array();
+
+            if (bytes[0] == (byte) 0xFF && bytes[1] == (byte) 0xD8) {
+                return parseJpegCameraExif(bytes, bufferSize);
+            }
+            if ((bytes[0] == 0x49 && bytes[1] == 0x49) || (bytes[0] == 0x4D && bytes[1] == 0x4D)) {
+                return parseTiffCameraExif(bytes, 0, bufferSize);
+            }
+        } catch (IOException e) {
+            log.debug("Unable to read Camera EXIF for {}: {}", file, e.getMessage());
+        }
+        return null;
+    }
+
+    private CameraExifInfo parseJpegCameraExif(byte[] imageBytes, int length) {
+        int offset = 2;
+        while (offset + 4 < length) {
+            if (imageBytes[offset] != (byte) 0xFF) {
+                break;
+            }
+
+            int marker = imageBytes[offset + 1] & 0xFF;
+            if (marker == 0xD9 || marker == 0xDA) {
+                break;
+            }
+
+            int segmentLength = ((imageBytes[offset + 2] & 0xFF) << 8) | (imageBytes[offset + 3] & 0xFF);
+            int payloadStart = offset + 4;
+            int payloadEnd = Math.min(length, payloadStart + segmentLength - 2);
+
+            if (marker == 0xE1 && payloadStart + 6 <= payloadEnd) {
+                if (imageBytes[payloadStart] == 0x45 && imageBytes[payloadStart + 1] == 0x78 &&
+                    imageBytes[payloadStart + 2] == 0x69 && imageBytes[payloadStart + 3] == 0x66 &&
+                    imageBytes[payloadStart + 4] == 0x00 && imageBytes[payloadStart + 5] == 0x00) {
+
+                    return parseTiffCameraExif(imageBytes, payloadStart + 6, payloadEnd);
+                }
+            }
+
+            offset = payloadStart + segmentLength - 2;
+        }
+        return null;
+    }
+
+    private CameraExifInfo parseTiffCameraExif(byte[] bytes, int tiffStart, int length) {
+        if (tiffStart + 8 > length) {
+            return null;
+        }
+
+        boolean littleEndian = bytes[tiffStart] == 0x49 && bytes[tiffStart + 1] == 0x49;
+        boolean bigEndian = bytes[tiffStart] == 0x4D && bytes[tiffStart + 1] == 0x4D;
+        if (!littleEndian && !bigEndian) {
+            return null;
+        }
+
+        int magic = readUnsignedShort(bytes, tiffStart + 2, littleEndian);
+        if (magic != 42) {
+            return null;
+        }
+
+        int ifd0Offset = readUnsignedInt(bytes, tiffStart + 4, littleEndian);
+        if (ifd0Offset < 0 || tiffStart + ifd0Offset + 2 > length) {
+            return null;
+        }
+
+        int entryCount = readUnsignedShort(bytes, tiffStart + ifd0Offset, littleEndian);
+        int cursor = tiffStart + ifd0Offset + 2;
+
+        String make = null;
+        String model = null;
+        String software = null;
+        int orientation = 1;
+        String lensModel = null;
+        int subIfdOffset = 0;
+
+        for (int i = 0; i < entryCount; i++) {
+            if (cursor + 12 > length) {
+                break;
+            }
+
+            int tag = readUnsignedShort(bytes, cursor, littleEndian);
+            int type = readUnsignedShort(bytes, cursor + 2, littleEndian);
+            int count = readUnsignedInt(bytes, cursor + 4, littleEndian);
+
+            if (tag == 0x010F && type == 2) { // Make
+                make = readTiffString(bytes, tiffStart, count, cursor, littleEndian, length);
+            } else if (tag == 0x0110 && type == 2) { // Model
+                model = readTiffString(bytes, tiffStart, count, cursor, littleEndian, length);
+            } else if (tag == 0x0112 && type == 3) { // Orientation
+                orientation = readUnsignedShort(bytes, cursor + 8, littleEndian);
+            } else if (tag == 0x0131 && type == 2) { // Software
+                software = readTiffString(bytes, tiffStart, count, cursor, littleEndian, length);
+            } else if (tag == 0x8769 && (type == 4 || type == 3)) { // SubIFD pointer
+                subIfdOffset = readUnsignedInt(bytes, cursor + 8, littleEndian);
+            }
+
+            cursor += 12;
+        }
+
+        // Parse SubIFD (Exif IFD) for LensModel (0xA434)
+        if (subIfdOffset > 0 && tiffStart + subIfdOffset + 2 <= length) {
+            int subEntryCount = readUnsignedShort(bytes, tiffStart + subIfdOffset, littleEndian);
+            int subCursor = tiffStart + subIfdOffset + 2;
+            for (int i = 0; i < subEntryCount; i++) {
+                if (subCursor + 12 > length) {
+                    break;
+                }
+                int tag = readUnsignedShort(bytes, subCursor, littleEndian);
+                int type = readUnsignedShort(bytes, subCursor + 2, littleEndian);
+                int count = readUnsignedInt(bytes, subCursor + 4, littleEndian);
+
+                if (tag == 0xA434 && type == 2) { // LensModel
+                    lensModel = readTiffString(bytes, tiffStart, count, subCursor, littleEndian, length);
+                    break;
+                }
+                subCursor += 12;
+            }
+        }
+
+        if (make != null || model != null || software != null || lensModel != null) {
+            return new CameraExifInfo(make, model, software, orientation, lensModel);
+        }
+        return null;
+    }
+
+    private String readTiffString(byte[] bytes, int tiffStart, int count, int cursor, boolean littleEndian, int length) {
+        if (count <= 0) return null;
+        if (count <= 4) {
+            int end = 0;
+            while (end < count && (cursor + 8 + end) < length && bytes[cursor + 8 + end] != 0) {
+                end++;
+            }
+            return new String(bytes, cursor + 8, end, StandardCharsets.US_ASCII).trim();
+        } else {
+            int offset = readUnsignedInt(bytes, cursor + 8, littleEndian);
+            if (offset < 0 || tiffStart + offset + count > length) return null;
+            int end = 0;
+            while (end < count && (tiffStart + offset + end) < length && bytes[tiffStart + offset + end] != 0) {
+                end++;
+            }
+            return new String(bytes, tiffStart + offset, end, StandardCharsets.US_ASCII).trim();
+        }
+    }
+
     private Metadata parseJpegExif(byte[] imageBytes, int length) {
         int offset = 2;
         while (offset + 4 < length) {

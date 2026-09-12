@@ -29,7 +29,9 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -44,6 +46,36 @@ public class MediaExtractorService {
 
     private static final Logger log = LoggerFactory.getLogger(MediaExtractorService.class);
 
+    private static final Set<String> IGNORED_SYSTEM_DIRECTORIES = Set.of(
+            "$recycle.bin",
+            "system volume information",
+            "recovery",
+            "config.msi",
+            "msocache",
+            "$winreagent",
+            "$sysreset",
+            ".trash",
+            ".trash-1000",
+            ".trashes",
+            ".fseventsd",
+            ".spotlight-v100",
+            ".temporaryitems"
+    );
+
+    public static boolean isSystemOrRecycleDirectory(Path dir) {
+        if (dir == null || dir.getFileName() == null) {
+            return false;
+        }
+        String name = dir.getFileName().toString().trim();
+        if (name.isEmpty()) {
+            return false;
+        }
+        if (name.startsWith("$")) {
+            return true;
+        }
+        return IGNORED_SYSTEM_DIRECTORIES.contains(name.toLowerCase(Locale.ROOT));
+    }
+
     private final MediaMetadataService metadataService;
     private final MediaIntegrityService integrityService;
     private final DuplicateDetectionService duplicateService;
@@ -55,6 +87,8 @@ public class MediaExtractorService {
     private volatile ExtractionReport lastReport;
     private boolean quarantineEnabled = true;
     private boolean preserveTimestamps = true;
+    private final CopyOnWriteArrayList<Path> extractedImagePaths = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<Path> newlyExtractedFiles = new CopyOnWriteArrayList<>();
 
     public MediaExtractorService() {
         this(new MediaMetadataService());
@@ -105,8 +139,18 @@ public class MediaExtractorService {
 
     public ExtractionReport startReport() {
         duplicateService.clear();
+        extractedImagePaths.clear();
+        newlyExtractedFiles.clear();
         lastReport = new ExtractionReport();
         return lastReport;
+    }
+
+    public List<Path> getExtractedImagePaths() {
+        return List.copyOf(extractedImagePaths);
+    }
+
+    public List<Path> getNewlyExtractedFiles() {
+        return List.copyOf(newlyExtractedFiles);
     }
 
     public void cleanupTempDir() {
@@ -146,6 +190,15 @@ public class MediaExtractorService {
         try {
             Files.walkFileTree(sourceDir, new SimpleFileVisitor<>() {
                 @Override
+                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                    if (isSystemOrRecycleDirectory(dir)) {
+                        log.debug("Skipping system/recycle directory: {}", dir);
+                        return FileVisitResult.SKIP_SUBTREE;
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
                 public FileVisitResult visitFile(@NonNull Path file, BasicFileAttributes attrs) {
                     String fileName = file.getFileName().toString();
                     // Early filter: skip non-media files immediately without acquiring permits
@@ -173,6 +226,13 @@ public class MediaExtractorService {
                     }
                     return FileVisitResult.CONTINUE;
                 }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                    log.warn("Skipping inaccessible path during scan: {} ({})", file, exc.getMessage());
+                    runReport.failed(file.toString(), "scan_access", exc.getClass().getSimpleName() + ": " + exc.getMessage());
+                    return FileVisitResult.SKIP_SUBTREE;
+                }
             });
             log.info("Finished scanning source directory. Queued {} items for processing", queuedItems.get());
         } catch (IOException e) {
@@ -199,6 +259,7 @@ public class MediaExtractorService {
                 String type = isPhoto(fileName) ? "photo" : (isVideo(fileName) ? "video" : "archive");
                 Path quarantined = integrityService.quarantineFile(sourceFile, baseMemoriesDir, meta.year(), type, "file failed validation or is empty");
                 if (quarantined != null) {
+                    newlyExtractedFiles.add(quarantined.toAbsolutePath().normalize());
                     report.quarantined(sourceFile.toString(), "quarantined to " + quarantined);
                 }
             }
@@ -286,6 +347,11 @@ public class MediaExtractorService {
 
                     log.info("Copied media file to: {}", targetFile);
                     report.extracted(type, year, size);
+                    Path normalizedTarget = targetFile.toAbsolutePath().normalize();
+                    newlyExtractedFiles.add(normalizedTarget);
+                    if ("photo".equals(type)) {
+                        extractedImagePaths.add(normalizedTarget);
+                    }
                     return;
                 } catch (java.nio.file.FileAlreadyExistsException e) {
                     targetFile = duplicateService.getUniqueFileName(targetDir, fileName);
@@ -384,7 +450,10 @@ public class MediaExtractorService {
                 log.warn("Skipping corrupted archive entry: {}", fileName);
                 report.corrupted(fileName, "archive entry failed validation or is empty");
                 if (quarantineEnabled) {
-                    integrityService.quarantineFile(tempFile, baseMemoriesDir, year, type, "corrupted archive entry");
+                    Path quarantined = integrityService.quarantineFile(tempFile, baseMemoriesDir, year, type, "corrupted archive entry");
+                    if (quarantined != null) {
+                        newlyExtractedFiles.add(quarantined.toAbsolutePath().normalize());
+                    }
                     report.quarantined(fileName, "quarantined archive entry");
                 }
                 return;
@@ -440,6 +509,11 @@ public class MediaExtractorService {
 
                     log.info("Extracted media file to: {}", targetFile);
                     report.extracted(type, year, size);
+                    Path normalizedTarget = targetFile.toAbsolutePath().normalize();
+                    newlyExtractedFiles.add(normalizedTarget);
+                    if ("photo".equals(type)) {
+                        extractedImagePaths.add(normalizedTarget);
+                    }
                     return;
                 } catch (java.nio.file.FileAlreadyExistsException e) {
                     targetFile = duplicateService.getUniqueFileName(targetDir, fileName);

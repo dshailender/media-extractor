@@ -5,7 +5,7 @@
 **Media Extractor** is a Spring Boot CLI application that extracts photos and videos from directories and nested archives, organizing them by capture year in a flat directory structure.
 
 **Core workflow:**
-1. **Extraction phase**: Recursively scan source directory, extract media from archives, copy photos/videos to `~/memories/{YYYY}/photos` and `~/memories/{YYYY}/videos` (where {YYYY} is the year extracted from file modification time)
+1. **Extraction phase**: Recursively scan source directory, extract media from archives, copy photos/videos to `~/archive/memories/{YYYY}/photos` and `~/archive/memories/{YYYY}/videos` (where {YYYY} is the year extracted from file modification time)
 2. **Flat structure**: No subdirectories preserved from source - all files organized only by year and type
 
 ## Essential Build & Test Commands
@@ -32,10 +32,12 @@ See [HELP.md](HELP.md) for detailed usage examples and output directory structur
 src/main/java/com/example/mediaextractor/
   ├── MediaExtractorApplication.java      # CLI entry point, orchestrates workflow
   ├── MediaExtractorService.java          # Core extraction logic (archives, file detection)
+  ├── IncrementalBackupService.java       # Multi-part 7-Zip incremental backup & integrity testing
   └── MediaConsolidationService.java      # (Deprecated) Consolidation & collision handling - no longer used
 
 src/test/java/com/example/mediaextractor/
   ├── MediaExtractorServiceTest.java              # Comprehensive tests for year-based flat extraction
+  ├── IncrementalBackupServiceTest.java           # Tests for incremental packaging & 7z volume splitting
   ├── MediaConsolidationServiceConcurrencyTest.java  # Legacy collision detection verification
   └── MediaExtractorApplicationTests.java            # Context load test
 ```
@@ -54,7 +56,7 @@ src/test/java/com/example/mediaextractor/
 - **Key method**: `MediaExtractorService.copyMediaFileFlattened()`
 
 ### 3. **Concurrent Processing with Virtual Threads**
-- Uses Spring Boot 4.1.0 with Java 25 virtual threads for high-concurrency I/O
+- Uses Spring Boot 4.1.1 with Java 25 virtual threads for high-concurrency I/O
 - `ExecutorService` with `newVirtualThreadPerTaskExecutor()` for extraction phase
 - **Key places**: `MediaExtractorApplication.run()`, `MediaExtractorService.processArchive()`
 
@@ -74,11 +76,20 @@ src/test/java/com/example/mediaextractor/
 - Filename collisions handled by appending `_1`, `_2`, etc. suffix
 - **Key method**: `MediaExtractorService.getUniqueFileName()`
 
+### 7. **Incremental Backup & Multi-Part 7-Zip Packaging**
+- `--incremental` flag runs incremental packaging of newly added media
+- Only newly written files in the current run (`MediaExtractorService.newlyExtractedFiles`) are packaged
+- Resolves post-classification relocated files (e.g. memes/greetings moved to `quarantine/{YYYY}/memes`) to preserve target filesystem structure
+- Includes current run's extraction reports (`media-extraction-report-*.json/html`) and CSV logs (`classification_results.csv`, `review_queue.csv`)
+- Invokes native `/usr/bin/7z` with `-v4g`, `-mx=1` (fast compression), and `-mmt=on`
+- Tests archive integrity via `7z t` and emits a detailed JSON receipt in `<output>/backups/`
+- Local files are ready for manual user transfer to external drive
+
 ## Important Implementation Details
 
 ### Path Handling
-- Output base directory: `~/memories/` (user home directory)
-- Year-based subdirectories created on-demand: `~/memories/{YYYY}/photos` and `~/memories/{YYYY}/videos`
+- Output base directory: `~/archive/memories/` (user home directory)
+- Year-based subdirectories created on-demand: `~/archive/memories/{YYYY}/photos` and `~/archive/memories/{YYYY}/videos`
 - All paths normalized and made absolute: `.toAbsolutePath().normalize()`
 - Source directory path ignored - only year and media type determine output location
 

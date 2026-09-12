@@ -31,3 +31,17 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Local Environment & Secrets ###
+.env
+.env.*
+!.env.example
+application-local.properties
+
+### Python Virtual Environment & Classifier Logs ###
+.venv/
+.cache/
+__pycache__/
+*.pyc
+classification_results.csv
+*.csv
