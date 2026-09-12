@@ -11,6 +11,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -82,6 +83,8 @@ public class PythonClassifierProcessService {
         }
 
         Path workingDirectory = resolvePath(environment.getProperty("media-extractor.classifier-working-directory", ""), Path.of("."));
+        syncGeneratedCsvsToOutput(workingDirectory, memoriesDir);
+
         Path python = resolvePath(environment.getProperty("media-extractor.classifier-python", ".venv/bin/python"), workingDirectory);
         Path script = resolvePath(environment.getProperty("media-extractor.classifier-script", "scripts/classify_memes.py"), workingDirectory);
         String action = options != null && options.actionOverride() != null
@@ -132,6 +135,7 @@ public class PythonClassifierProcessService {
             } else {
                 log.info("No new extraction output and no pending resumable classification work found in memories directory.");
             }
+            syncGeneratedCsvsToOutput(workingDirectory, memoriesDir);
             return;
         }
 
@@ -143,6 +147,7 @@ public class PythonClassifierProcessService {
             JavaClassifierTriageService.TriageSummary summary = triageService.triageAndStage(finalCandidates, memoriesDir, "dry-run", maxConcurrency);
             log.info("Java-only triage complete: {} certified photos, {} deferred candidates",
                     summary.certifiedPhotos(), summary.stagedForPython());
+            syncGeneratedCsvsToOutput(workingDirectory, memoriesDir);
             return;
         }
 
@@ -153,6 +158,7 @@ public class PythonClassifierProcessService {
         } else {
             executeDirectPython(memoriesDir, finalCandidates, environment, workingDirectory, python, script, action, quarantine);
         }
+        syncGeneratedCsvsToOutput(workingDirectory, memoriesDir);
     }
 
     private void executeWithJavaTriage(
@@ -241,6 +247,7 @@ public class PythonClassifierProcessService {
                 }
                 triageService.cleanupStagingDir(triageSummary);
             }
+            syncGeneratedCsvsToOutput(workingDirectory, memoriesDir);
         }
     }
 
@@ -298,6 +305,7 @@ public class PythonClassifierProcessService {
                     log.warn("Could not delete classifier manifest {}: {}", manifest, e.getMessage());
                 }
             }
+            syncGeneratedCsvsToOutput(workingDirectory, memoriesDir);
         }
     }
 
@@ -317,9 +325,26 @@ public class PythonClassifierProcessService {
         if (quarantine) {
             command.add("--quarantine");
         }
+
+        String outputCsv = environment != null ? environment.getProperty("media-extractor.classifier-output-csv", "").trim() : "";
+        if (!outputCsv.isEmpty()) {
+            command.add("--output-csv");
+            command.add(outputCsv);
+        } else {
+            command.add("--output-csv");
+            command.add(memoriesDir.resolve("classification_results.csv").toAbsolutePath().normalize().toString());
+        }
+
+        String reviewCsv = environment != null ? environment.getProperty("media-extractor.classifier-review-csv", "").trim() : "";
+        if (!reviewCsv.isEmpty()) {
+            command.add("--review-csv");
+            command.add(reviewCsv);
+        } else {
+            command.add("--review-csv");
+            command.add(memoriesDir.resolve("review_queue.csv").toAbsolutePath().normalize().toString());
+        }
+
         if (environment != null) {
-            addOptionalArgument(command, environment, "media-extractor.classifier-output-csv", "--output-csv");
-            addOptionalArgument(command, environment, "media-extractor.classifier-review-csv", "--review-csv");
             addOptionalArgument(command, environment, "media-extractor.classifier-state-db", "--state-db");
             addOptionalArgument(command, environment, "media-extractor.classifier-fingerprint-strategy", "--fingerprint-strategy");
             addOptionalArgument(command, environment, "media-extractor.classifier-lease-timeout-seconds", "--lease-timeout");
@@ -336,6 +361,25 @@ public class PythonClassifierProcessService {
             addOptionalArgument(command, environment, "media-extractor.classifier-review-link-type", "--review-link-type");
         }
         return command;
+    }
+
+    static void syncGeneratedCsvsToOutput(Path workingDirectory, Path memoriesDir) {
+        if (workingDirectory == null || memoriesDir == null) {
+            return;
+        }
+        for (String csvName : List.of("classification_results.csv", "review_queue.csv")) {
+            Path src = workingDirectory.resolve(csvName);
+            Path dest = memoriesDir.resolve(csvName);
+            if (Files.exists(src) && !src.toAbsolutePath().normalize().equals(dest.toAbsolutePath().normalize())) {
+                try {
+                    Files.createDirectories(memoriesDir);
+                    Files.copy(src, dest, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+                    log.info("Copied {} from working directory to output directory: {}", csvName, dest);
+                } catch (IOException e) {
+                    log.warn("Could not copy {} to {}: {}", csvName, dest, e.getMessage());
+                }
+            }
+        }
     }
 
     private static void addOptionalArgument(List<String> command, Environment environment, String property, String option) {

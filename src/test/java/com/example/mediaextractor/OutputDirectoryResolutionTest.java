@@ -11,7 +11,7 @@ class OutputDirectoryResolutionTest {
     @Test
     void testDefaultOutputDirectoryWhenUnspecified() {
         Path defaultOutput = MediaExtractorApplication.resolveOutputDirectory(null, null);
-        Path expected = Path.of(System.getProperty("user.home")).resolve("memories").toAbsolutePath().normalize();
+        Path expected = Path.of(System.getProperty("user.home")).resolve("archive").resolve("memories").toAbsolutePath().normalize();
         assertEquals(expected, defaultOutput);
 
         Path blankOutput = MediaExtractorApplication.resolveOutputDirectory("   ", "");
@@ -123,7 +123,7 @@ class OutputDirectoryResolutionTest {
         assertNull(parsed.outputArgument());
 
         Path resolved = MediaExtractorApplication.resolveOutputDirectory(parsed.outputArgument(), null);
-        assertEquals(Path.of(System.getProperty("user.home")).resolve("memories").toAbsolutePath().normalize(), resolved);
+        assertEquals(Path.of(System.getProperty("user.home")).resolve("archive").resolve("memories").toAbsolutePath().normalize(), resolved);
     }
 
     @Test

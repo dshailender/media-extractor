@@ -289,6 +289,31 @@ class TestClassifierState(unittest.TestCase):
         self.assertEqual(len(reader), 1)
         store.release_lock()
 
+    def test_import_legacy_csv_with_source_dir_rebasing(self):
+        new_source_dir = self.test_dir / "archive" / "memories"
+        photo_dir = new_source_dir / "2024" / "photos"
+        photo_dir.mkdir(parents=True, exist_ok=True)
+        photo_file = photo_dir / "img_test.jpg"
+        photo_file.write_text("photo-data-for-rebasing")
+
+        legacy_csv = self.test_dir / "legacy.csv"
+        with open(legacy_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["file_path", "category", "confidence", "tier", "decision_reason", "uncertainty"])
+            writer.writerow(["/home/user/memories/2024/photos/img_test.jpg", "PHOTO", "0.95", "EXIF", "Camera", "0.05"])
+
+        store = ClassifierStateStore(self.db_path, run_id="run-legacy-rebase")
+        store.acquire_lock()
+        imported = store.import_legacy_csv(legacy_csv, source_dir=new_source_dir)
+        self.assertEqual(imported, 1)
+
+        item_id = compute_item_id(str(photo_file))
+        record = store.get_item_by_id(item_id)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.category, "PHOTO")
+        self.assertEqual(record.status, LifecycleStatus.COMPLETED.value)
+        store.release_lock()
+
     def test_dry_run_and_review_pending_behavior(self):
         store = ClassifierStateStore(self.db_path, run_id="run-rev", action="dry-run")
         store.acquire_lock()

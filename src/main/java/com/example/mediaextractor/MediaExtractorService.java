@@ -88,6 +88,7 @@ public class MediaExtractorService {
     private boolean quarantineEnabled = true;
     private boolean preserveTimestamps = true;
     private final CopyOnWriteArrayList<Path> extractedImagePaths = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<Path> newlyExtractedFiles = new CopyOnWriteArrayList<>();
 
     public MediaExtractorService() {
         this(new MediaMetadataService());
@@ -139,12 +140,17 @@ public class MediaExtractorService {
     public ExtractionReport startReport() {
         duplicateService.clear();
         extractedImagePaths.clear();
+        newlyExtractedFiles.clear();
         lastReport = new ExtractionReport();
         return lastReport;
     }
 
     public List<Path> getExtractedImagePaths() {
         return List.copyOf(extractedImagePaths);
+    }
+
+    public List<Path> getNewlyExtractedFiles() {
+        return List.copyOf(newlyExtractedFiles);
     }
 
     public void cleanupTempDir() {
@@ -253,6 +259,7 @@ public class MediaExtractorService {
                 String type = isPhoto(fileName) ? "photo" : (isVideo(fileName) ? "video" : "archive");
                 Path quarantined = integrityService.quarantineFile(sourceFile, baseMemoriesDir, meta.year(), type, "file failed validation or is empty");
                 if (quarantined != null) {
+                    newlyExtractedFiles.add(quarantined.toAbsolutePath().normalize());
                     report.quarantined(sourceFile.toString(), "quarantined to " + quarantined);
                 }
             }
@@ -340,8 +347,10 @@ public class MediaExtractorService {
 
                     log.info("Copied media file to: {}", targetFile);
                     report.extracted(type, year, size);
+                    Path normalizedTarget = targetFile.toAbsolutePath().normalize();
+                    newlyExtractedFiles.add(normalizedTarget);
                     if ("photo".equals(type)) {
-                        extractedImagePaths.add(targetFile.toAbsolutePath().normalize());
+                        extractedImagePaths.add(normalizedTarget);
                     }
                     return;
                 } catch (java.nio.file.FileAlreadyExistsException e) {
@@ -441,7 +450,10 @@ public class MediaExtractorService {
                 log.warn("Skipping corrupted archive entry: {}", fileName);
                 report.corrupted(fileName, "archive entry failed validation or is empty");
                 if (quarantineEnabled) {
-                    integrityService.quarantineFile(tempFile, baseMemoriesDir, year, type, "corrupted archive entry");
+                    Path quarantined = integrityService.quarantineFile(tempFile, baseMemoriesDir, year, type, "corrupted archive entry");
+                    if (quarantined != null) {
+                        newlyExtractedFiles.add(quarantined.toAbsolutePath().normalize());
+                    }
                     report.quarantined(fileName, "quarantined archive entry");
                 }
                 return;
@@ -497,8 +509,10 @@ public class MediaExtractorService {
 
                     log.info("Extracted media file to: {}", targetFile);
                     report.extracted(type, year, size);
+                    Path normalizedTarget = targetFile.toAbsolutePath().normalize();
+                    newlyExtractedFiles.add(normalizedTarget);
                     if ("photo".equals(type)) {
-                        extractedImagePaths.add(targetFile.toAbsolutePath().normalize());
+                        extractedImagePaths.add(normalizedTarget);
                     }
                     return;
                 } catch (java.nio.file.FileAlreadyExistsException e) {

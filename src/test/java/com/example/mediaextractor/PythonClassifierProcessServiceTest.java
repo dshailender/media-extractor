@@ -3,6 +3,9 @@ package com.example.mediaextractor;
 import org.junit.jupiter.api.Test;
 import org.springframework.mock.env.MockEnvironment;
 
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -66,6 +69,46 @@ class PythonClassifierProcessServiceTest {
         assertTrue(command.contains("output.csv"));
         assertTrue(command.contains("--review-csv"));
         assertTrue(command.contains("review.csv"));
+    }
+
+    @Test
+    void testBuildCommandDefaultCsvOutputsInMemoriesDir() {
+        Path python = Path.of(".venv/bin/python");
+        Path script = Path.of("scripts/classify_memes.py");
+        Path memoriesDir = Path.of("/home/user/archive/memories");
+        Path manifest = Path.of("/tmp/test.manifest");
+        MockEnvironment env = new MockEnvironment();
+
+        List<String> command = PythonClassifierProcessService.buildCommand(
+                python, script, memoriesDir, manifest, "move", true, env
+        );
+
+        assertTrue(command.contains("--output-csv"));
+        assertTrue(command.contains(memoriesDir.resolve("classification_results.csv").toAbsolutePath().normalize().toString()));
+        assertTrue(command.contains("--review-csv"));
+        assertTrue(command.contains(memoriesDir.resolve("review_queue.csv").toAbsolutePath().normalize().toString()));
+    }
+
+    @Test
+    void testSyncGeneratedCsvsToOutput(@TempDir Path tempDir) throws Exception {
+        Path workingDir = tempDir.resolve("working");
+        Path memoriesDir = tempDir.resolve("memories");
+        Files.createDirectories(workingDir);
+        Files.createDirectories(memoriesDir);
+
+        Path workCsv1 = workingDir.resolve("classification_results.csv");
+        Path workCsv2 = workingDir.resolve("review_queue.csv");
+        Files.writeString(workCsv1, "dummy,results\n");
+        Files.writeString(workCsv2, "dummy,queue\n");
+
+        PythonClassifierProcessService.syncGeneratedCsvsToOutput(workingDir, memoriesDir);
+
+        Path destCsv1 = memoriesDir.resolve("classification_results.csv");
+        Path destCsv2 = memoriesDir.resolve("review_queue.csv");
+        assertTrue(Files.exists(destCsv1));
+        assertTrue(Files.exists(destCsv2));
+        assertEquals("dummy,results\n", Files.readString(destCsv1));
+        assertEquals("dummy,queue\n", Files.readString(destCsv2));
     }
 
     @Test

@@ -2,8 +2,8 @@
 set -e
 
 # Media Extractor: Unified Media Extraction & Multi-Modal Classification Runner
-# Extracts photos/videos to ~/memories/{YYYY}/, then classifies photos and moves
-# memes and greetings to ~/memories/quarantine/{YYYY}/.
+# Extracts photos/videos to ~/archive/memories/{YYYY}/, then classifies photos and moves
+# memes and greetings to ~/archive/memories/quarantine/{YYYY}/.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -43,7 +43,7 @@ if [ -z "${SOURCE_DIR}" ] && [ $# -eq 0 ] && [ -z "${OUTPUT_DIR}" ]; then
     echo "Usage: $0 [source_directory] [output_directory] [options]"
     echo ""
     echo "Options:"
-    echo "  -o, --output=<dir> Output base directory (default: ~/memories)"
+    echo "  -o, --output=<dir> Output base directory (default: ~/archive/memories)"
     echo "  --output-dir=<dir> Alias for --output"
     echo "  --classify        Only classify extracted files in the output directory (skips extraction)"
     echo "  --resume          Resume classification on existing memories directory"
@@ -52,13 +52,19 @@ if [ -z "${SOURCE_DIR}" ] && [ $# -eq 0 ] && [ -z "${OUTPUT_DIR}" ]; then
     echo "  --no-classify     Skip Python classification entirely"
     echo "  --no-quarantine   Move memes/greetings directly to {output}/{YYYY}/ instead of quarantine"
     echo "  --no-resume       Disable resume and reprocess all files"
+    echo "  --incremental     Package newly extracted files into multi-part 7-Zip backup"
+    echo "  --backup-dir=<dir> Destination directory for 7-Zip backup parts (default: <output>/backups)"
+    echo "  --backup-part-size=<size> Volume split size, e.g. 4g, 2g, 1000m (default: 4g)"
+    echo "  --backup-compression=<level> Compression level: 0, 1 (fast, default), 5, 9"
     echo "  --state-db=<path> Custom SQLite state database location"
     echo ""
     echo "Examples:"
     echo "  $0 /path/to/backup"
+    echo "  $0 /path/to/backup --incremental"
     echo "  $0 /path/to/backup /path/to/output"
     echo "  $0 /path/to/backup --output=/path/to/output"
     echo "  $0 /path/to/backup -o ~/my_memories --dry-run"
+    echo "  $0 /path/to/backup --incremental --backup-dir=/path/to/backup_folder"
     echo "  $0 --classify"
     echo "  $0 --classify /path/to/output"
     echo "  $0 /path/to/output --classify"
@@ -118,6 +124,30 @@ while [ $# -gt 0 ]; do
             EXTRA_ARGS+=("--media-extractor.classifier-state-db=$2")
             shift 2
             ;;
+        --incremental)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+        --backup-dir=*)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+        --backup-dir|-b)
+            EXTRA_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        -b=*)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+        --backup-part-size=*|--backup-compression=*|--backup-7z-binary=*)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+        --backup-part-size|--backup-compression|--backup-7z-binary)
+            EXTRA_ARGS+=("$1" "$2")
+            shift 2
+            ;;
         *)
             EXTRA_ARGS+=("$1")
             shift
@@ -132,7 +162,7 @@ if [ "${CLASSIFY_ONLY}" = true ]; then
     SOURCE_DIR=""
 fi
 
-RESOLVED_OUTPUT="${OUTPUT_DIR:-~/memories}"
+RESOLVED_OUTPUT="${OUTPUT_DIR:-~/archive/memories}"
 
 echo "=========================================================="
 echo "Media Extractor: Unified Extraction & Classification"
@@ -145,6 +175,9 @@ echo "Output:          ${RESOLVED_OUTPUT} (base directory)"
 echo "Mode:            java-triage-python (default)"
 echo "Action:          move (default)"
 echo "Quarantine:      ${RESOLVED_OUTPUT}/quarantine/{YYYY}/ (default)"
+if [[ " ${EXTRA_ARGS[*]} " =~ " --incremental" ]]; then
+    echo "Backup:          Incremental 7-Zip backup enabled"
+fi
 echo "=========================================================="
 
 CMD=(java -jar "${JAR_FILE}")

@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import sqlite3
@@ -280,7 +281,7 @@ class ClassifierStateStore:
         command_line: str = "",
     ):
         if db_path is None:
-            self.db_path = (Path.home() / "memories" / ".classifier-state" / "classification.sqlite3").resolve()
+            self.db_path = (Path.home() / "archive" / "memories" / ".classifier-state" / "classification.sqlite3").resolve()
         else:
             self.db_path = db_path.resolve()
         self.run_id = run_id or f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -1086,10 +1087,11 @@ class ClassifierStateStore:
     # Legacy CSV Migration & CSV Synchronization
     # -------------------------------------------------------------------------
 
-    def import_legacy_csv(self, csv_path: Path) -> int:
+    def import_legacy_csv(self, csv_path: Path, source_dir: Optional[Path] = None) -> int:
         """
         Imports legacy CSV records into the SQLite database.
         Validates file existence and fingerprint to prevent stale entries.
+        Optionally re-bases paths against source_dir if the original absolute path is missing.
         """
         if not csv_path.exists():
             return 0
@@ -1108,6 +1110,20 @@ class ClassifierStateStore:
                             continue
 
                         p = Path(raw_path).expanduser().resolve()
+                        if not p.exists() and source_dir:
+                            resolved_sd = source_dir.resolve()
+                            candidate = resolved_sd / Path(raw_path).name
+                            if not candidate.exists():
+                                parts = Path(raw_path).parts
+                                for i in range(len(parts) - 1, 0, -1):
+                                    if re.fullmatch(r"\d{4}", parts[i]):
+                                        sub_candidate = resolved_sd.joinpath(*parts[i:])
+                                        if sub_candidate.exists():
+                                            candidate = sub_candidate
+                                            break
+                            if candidate.exists():
+                                p = candidate
+
                         if not p.exists():
                             continue
 

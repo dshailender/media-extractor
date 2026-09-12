@@ -4,6 +4,7 @@ package com.example.mediaextractor;
 import org.jspecify.annotations.NonNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -12,7 +13,10 @@ import org.springframework.core.env.Profiles;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -25,13 +29,23 @@ public class MediaExtractorApplication implements CommandLineRunner {
     private final MediaExtractorService mediaExtractorService;
     private final Environment environment;
     private final PythonClassifierProcessService classifierProcessService;
+    private final IncrementalBackupService incrementalBackupService;
+
+    @Autowired
+    public MediaExtractorApplication(MediaExtractorService mediaExtractorService,
+                                     Environment environment,
+                                     PythonClassifierProcessService classifierProcessService,
+                                     IncrementalBackupService incrementalBackupService) {
+        this.mediaExtractorService = mediaExtractorService;
+        this.environment = environment;
+        this.classifierProcessService = classifierProcessService;
+        this.incrementalBackupService = incrementalBackupService;
+    }
 
     public MediaExtractorApplication(MediaExtractorService mediaExtractorService,
                                      Environment environment,
                                      PythonClassifierProcessService classifierProcessService) {
-        this.mediaExtractorService = mediaExtractorService;
-        this.environment = environment;
-        this.classifierProcessService = classifierProcessService;
+        this(mediaExtractorService, environment, classifierProcessService, new IncrementalBackupService());
     }
 
     static void main(String[] args) {
@@ -86,6 +100,7 @@ public class MediaExtractorApplication implements CommandLineRunner {
             sourceDir = Path.of("C:\\Users\\Shailender\\projects\\backup").toAbsolutePath().normalize();
         }
 
+        ExtractionReportWriter.ReportPaths reportPaths = null;
         if (shouldExtract) {
             log.info("Starting media extraction workflow with sourceDir={}, outputBaseDir={}",
                     sourceDir, baseMemoriesDir);
@@ -129,7 +144,7 @@ public class MediaExtractorApplication implements CommandLineRunner {
                 mediaExtractorService.finishReport();
                 ExtractionReport report = mediaExtractorService.getLastReport();
                 if (report != null) {
-                    ExtractionReportWriter.ReportPaths reportPaths = new ExtractionReportWriter()
+                    reportPaths = new ExtractionReportWriter()
                         .write(report, reportDirectory, sourceDir.toString(), baseMemoriesDir.toString());
                     log.info("Extraction report written to JSON={} and HTML={}", reportPaths.json(), reportPaths.html());
                     log.info("Extraction summary: scanned={}, extracted={}, duplicates={}, corrupted={}, quarantined={}, failed={}, durationMs={}, rate={}/s",
@@ -159,6 +174,73 @@ public class MediaExtractorApplication implements CommandLineRunner {
                 classifierModeOverride
             ));
 
+        boolean incremental = parsed.incremental() || environment.getProperty("media-extractor.backup.incremental", Boolean.class, false);
+        if (incremental) {
+            log.info("Incremental backup mode requested. Packaging newly added files into multi-part 7-Zip backup...");
+            String backupDirArg = parsed.backupDirArgument();
+            String configuredBackupDir = environment.getProperty("media-extractor.backup.dir", "");
+            Path backupDir;
+            if (backupDirArg != null && !backupDirArg.isBlank()) {
+                backupDir = expandUserHome(backupDirArg).toAbsolutePath().normalize();
+            } else if (!configuredBackupDir.isBlank()) {
+                backupDir = expandUserHome(configuredBackupDir).toAbsolutePath().normalize();
+            } else {
+                backupDir = baseMemoriesDir.resolve("backups").toAbsolutePath().normalize();
+            }
+
+            String partSize = parsed.backupPartSize();
+            if (partSize == null || partSize.isBlank()) {
+                partSize = environment.getProperty("media-extractor.backup.part-size", "4g");
+            }
+
+            Integer compression = parsed.backupCompression();
+            if (compression == null) {
+                compression = environment.getProperty("media-extractor.backup.compression", Integer.class, 1);
+            }
+
+            String sevenZipBinary = parsed.backup7zBinary();
+            if (sevenZipBinary == null || sevenZipBinary.isBlank()) {
+                sevenZipBinary = environment.getProperty("media-extractor.backup.7z-binary", "/usr/bin/7z");
+            }
+
+            List<Path> metadataFiles = new java.util.ArrayList<>();
+            if (reportPaths != null) {
+                metadataFiles.add(reportPaths.json());
+                metadataFiles.add(reportPaths.html());
+            }
+            metadataFiles.add(baseMemoriesDir.resolve("classification_results.csv"));
+            metadataFiles.add(baseMemoriesDir.resolve("review_queue.csv"));
+
+            IncrementalBackupService.BackupResult backupResult = incrementalBackupService.createIncrementalBackup(
+                    baseMemoriesDir,
+                    mediaExtractorService.getNewlyExtractedFiles(),
+                    metadataFiles,
+                    backupDir,
+                    partSize,
+                    compression,
+                    sevenZipBinary
+            );
+
+            if (backupResult.success()) {
+                if (!backupResult.createdVolumes().isEmpty()) {
+                    log.info("================================================================================");
+                    log.info("INCREMENTAL BACKUP COMPLETE: {} files packaged into {} volume(s)",
+                            backupResult.fileCount(), backupResult.createdVolumes().size());
+                    log.info("Backup Directory: {}", backupResult.backupDir());
+                    for (IncrementalBackupService.BackupVolume vol : backupResult.createdVolumes()) {
+                        log.info("  -> {} ({})", vol.fileName(), formatBytes(vol.sizeBytes()));
+                    }
+                    log.info("Receipt file:     {}", backupResult.receiptPath());
+                    log.info("Action Required:  You can now safely copy the volume files above to your external drive.");
+                    log.info("================================================================================");
+                } else {
+                    log.info("Incremental backup completed: No new files to back up.");
+                }
+            } else {
+                log.error("Incremental backup failed: {}", backupResult.message());
+            }
+        }
+
         log.info("Media extraction workflow completed");
     }
 
@@ -170,8 +252,40 @@ public class MediaExtractorApplication implements CommandLineRunner {
         Boolean classifierQuarantineOverride,
         String classifierModeOverride,
         String sourceArgument,
-        String outputArgument
-    ) {}
+        String outputArgument,
+        boolean incremental,
+        String backupDirArgument,
+        String backupPartSize,
+        Integer backupCompression,
+        String backup7zBinary
+    ) {
+        public ParsedArguments(
+            boolean sanitizeMode,
+            boolean classifyOnly,
+            Boolean classifierEnabledOverride,
+            String classifierActionOverride,
+            Boolean classifierQuarantineOverride,
+            String classifierModeOverride,
+            String sourceArgument,
+            String outputArgument
+        ) {
+            this(
+                sanitizeMode,
+                classifyOnly,
+                classifierEnabledOverride,
+                classifierActionOverride,
+                classifierQuarantineOverride,
+                classifierModeOverride,
+                sourceArgument,
+                outputArgument,
+                false,
+                null,
+                null,
+                null,
+                null
+            );
+        }
+    }
 
     public static ParsedArguments parseArguments(String... args) {
         boolean sanitizeMode = false;
@@ -182,6 +296,11 @@ public class MediaExtractorApplication implements CommandLineRunner {
         String classifierModeOverride = null;
         String sourceArgument = null;
         String outputArgument = null;
+        boolean incremental = false;
+        String backupDirArgument = null;
+        String backupPartSize = null;
+        Integer backupCompression = null;
+        String backup7zBinary = null;
 
         if (args != null) {
             for (int i = 0; i < args.length; i++) {
@@ -233,6 +352,32 @@ public class MediaExtractorApplication implements CommandLineRunner {
                     outputArgument = arg.substring("-o=".length()).trim();
                 } else if (lower.equals("-o") && i + 1 < args.length) {
                     outputArgument = args[++i].trim();
+                } else if (lower.equals("--incremental")) {
+                    incremental = true;
+                } else if (lower.startsWith("--backup-dir=")) {
+                    backupDirArgument = arg.substring("--backup-dir=".length()).trim();
+                    incremental = true;
+                } else if (lower.equals("--backup-dir") && i + 1 < args.length) {
+                    backupDirArgument = args[++i].trim();
+                    incremental = true;
+                } else if (lower.startsWith("-b=")) {
+                    backupDirArgument = arg.substring("-b=".length()).trim();
+                    incremental = true;
+                } else if (lower.equals("-b") && i + 1 < args.length) {
+                    backupDirArgument = args[++i].trim();
+                    incremental = true;
+                } else if (lower.startsWith("--backup-part-size=")) {
+                    backupPartSize = arg.substring("--backup-part-size=".length()).trim();
+                } else if (lower.equals("--backup-part-size") && i + 1 < args.length) {
+                    backupPartSize = args[++i].trim();
+                } else if (lower.startsWith("--backup-compression=")) {
+                    backupCompression = parseCompression(arg.substring("--backup-compression=".length()).trim());
+                } else if (lower.equals("--backup-compression") && i + 1 < args.length) {
+                    backupCompression = parseCompression(args[++i].trim());
+                } else if (lower.startsWith("--backup-7z-binary=")) {
+                    backup7zBinary = arg.substring("--backup-7z-binary=".length()).trim();
+                } else if (lower.equals("--backup-7z-binary") && i + 1 < args.length) {
+                    backup7zBinary = args[++i].trim();
                 } else if (!arg.startsWith("-")) {
                     if (sourceArgument == null) {
                         sourceArgument = arg;
@@ -258,7 +403,12 @@ public class MediaExtractorApplication implements CommandLineRunner {
             classifierQuarantineOverride,
             classifierModeOverride,
             sourceArgument,
-            outputArgument
+            outputArgument,
+            incremental,
+            backupDirArgument,
+            backupPartSize,
+            backupCompression,
+            backup7zBinary
         );
     }
 
@@ -271,7 +421,7 @@ public class MediaExtractorApplication implements CommandLineRunner {
         }
 
         if (rawPath == null || rawPath.isBlank()) {
-            return Path.of(System.getProperty("user.home")).resolve("memories").toAbsolutePath().normalize();
+            return Path.of(System.getProperty("user.home")).resolve("archive").resolve("memories").toAbsolutePath().normalize();
         }
 
         return expandUserHome(rawPath).toAbsolutePath().normalize();
@@ -290,5 +440,31 @@ public class MediaExtractorApplication implements CommandLineRunner {
             return Path.of(userHome).resolve(trimmed.substring(2));
         }
         return Path.of(trimmed);
+    }
+
+    private static Integer parseCompression(String str) {
+        if (str == null || str.isBlank()) return null;
+        String lower = str.toLowerCase().trim();
+        return switch (lower) {
+            case "store", "0" -> 0;
+            case "fast", "1" -> 1;
+            case "normal", "5" -> 5;
+            case "maximum", "7" -> 7;
+            case "ultra", "9" -> 9;
+            default -> {
+                try {
+                    yield Integer.parseInt(lower);
+                } catch (NumberFormatException e) {
+                    yield 1;
+                }
+            }
+        };
+    }
+
+    private static String formatBytes(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        int exp = (int) (Math.log(bytes) / Math.log(1024));
+        String pre = "KMGTPE".charAt(exp - 1) + "iB";
+        return String.format(Locale.ROOT, "%.2f %s", bytes / Math.pow(1024, exp), pre);
     }
 }

@@ -1434,30 +1434,30 @@ def main():
     load_env_file()
 
     parser = argparse.ArgumentParser(description="Media Extractor High-Accuracy Image Classifier (v2.0)")
-    parser.add_argument("--source-dir", type=str, default=str(Path.home() / "memories"),
-                        help="Root directory containing images to classify (default: ~/memories)")
+    parser.add_argument("--source-dir", type=str, default=str(Path.home() / "archive" / "memories"),
+                        help="Root directory containing images to classify (default: ~/archive/memories)")
     parser.add_argument("--input-manifest", type=str, default=None,
                         help="UTF-8 file containing one image path per line; limits processing to this run's outputs")
     parser.add_argument("--action", choices=["dry-run", "move", "copy"], default="dry-run",
                         help="Action to perform on classified memes/greetings (default: dry-run)")
     parser.add_argument("--quarantine", action="store_true",
-                        help="Route memes/greetings to ~/memories/quarantine/{YYYY}/memes|greetings/")
+                        help="Route memes/greetings to ~/archive/memories/quarantine/{YYYY}/memes|greetings/")
     parser.add_argument("--rescue", action="store_true",
-                        help="Rescue mode: rescans quarantine directory and returns valid photos back to ~/memories/{YYYY}/photos/")
+                        help="Rescue mode: rescans quarantine directory and returns valid photos back to ~/archive/memories/{YYYY}/photos/")
     parser.add_argument("--threshold", type=float, default=0.65,
                         help="Confidence threshold for decision engine (default: 0.65)")
     parser.add_argument("--ambiguity-margin", type=float, default=0.10,
                         help="Margin threshold between top 2 classes to trigger Gemini fallback (default: 0.10)")
     parser.add_argument("--rate-limit-rpm", type=float, default=12.0,
                         help="Max Gemini API requests per minute for Free Tier (default: 12.0)")
-    parser.add_argument("--output-csv", type=str, default="classification_results.csv",
-                        help="Path to output CSV log (default: classification_results.csv)")
+    parser.add_argument("--output-csv", type=str, default=None,
+                        help="Path to output CSV log (default: <source_dir>/classification_results.csv)")
     parser.add_argument("--review-threshold", type=float, default=0.40,
                         help="Uncertainty threshold above which items are routed to review queue (default: 0.40)")
-    parser.add_argument("--review-csv", type=str, default="review_queue.csv",
-                        help="Path to review queue CSV for uncertain cases (default: review_queue.csv)")
+    parser.add_argument("--review-csv", type=str, default=None,
+                        help="Path to review queue CSV for uncertain cases (default: <source_dir>/review_queue.csv)")
     parser.add_argument("--create-review-links", dest="create_review_links", action="store_true", default=True,
-                        help="Create shortcuts/symlinks for review items in ~/memories/quarantine/{YYYY}/review (default: True)")
+                        help="Create shortcuts/symlinks for review items in ~/archive/memories/quarantine/{YYYY}/review (default: True)")
     parser.add_argument("--no-review-links", dest="create_review_links", action="store_false",
                         help="Disable creating shortcuts/symlinks for review items")
     parser.add_argument("--review-link-type", choices=["auto", "symlink", "shortcut"], default="auto",
@@ -1530,8 +1530,8 @@ def main():
         return
 
     source_root = Path(args.source_dir).expanduser().resolve()
-    csv_file = Path(args.output_csv).resolve()
-    review_file = Path(args.review_csv).resolve()
+    csv_file = Path(args.output_csv).resolve() if args.output_csv else (source_root / "classification_results.csv").resolve()
+    review_file = Path(args.review_csv).resolve() if args.review_csv else (source_root / "review_queue.csv").resolve()
 
     if not source_root.exists():
         print(f"[ERROR] Source directory does not exist: {source_root}")
@@ -1591,7 +1591,7 @@ def main():
 
     # Import legacy CSV if available and state DB is fresh
     if csv_file.exists():
-        imported = state_store.import_legacy_csv(csv_file)
+        imported = state_store.import_legacy_csv(csv_file, source_dir=source_root)
         if imported > 0:
             print(f"[INFO] Imported {imported} historical records from legacy CSV: {csv_file}")
 

@@ -31,7 +31,7 @@ The recommended way to run Media Extractor is using the unified pipeline runner 
 The `run_pipeline.sh` script automatically:
 1. **Verifies the Python environment**: Creates `.venv` and installs multi-modal dependencies via `./scripts/setup_env.sh` if not already present.
 2. **Builds the application JAR**: Automatically packages `target/media-extractor-0.0.1-SNAPSHOT.jar` via `./mvnw package -DskipTests` if needed.
-3. **Executes the full pipeline**: Extracts media into `{output_directory}/{YYYY}/` (default: `~/memories/{YYYY}/`), performs instant Java camera triage, and runs multi-modal classification to quarantine memes and greetings.
+3. **Executes the full pipeline**: Extracts media into `{output_directory}/{YYYY}/` (default: `~/archive/memories/{YYYY}/`), performs instant Java camera triage, and runs multi-modal classification to quarantine memes and greetings.
 
 Alternatively, you can run the pre-built JAR directly:
 ```bash
@@ -40,28 +40,33 @@ java -jar target/media-extractor-0.0.1-SNAPSHOT.jar <source_directory> [output_d
 
 **Command-Line Flags & Options:**
 - `<source_directory>`: Source directory containing media files, folders, or nested archives.
-- `[output_directory]` / `-o <dir>` / `--output=<dir>` / `--output-dir=<dir>`: Output base directory (default: `~/memories`). Can be supplied as a flag or as an optional second positional argument. Supports tilde expansion (`~/...` to user home).
+- `[output_directory]` / `-o <dir>` / `--output=<dir>` / `--output-dir=<dir>`: Output base directory (default: `~/archive/memories`). Can be supplied as a flag or as an optional second positional argument. Supports tilde expansion (`~/...` to user home).
 - `--mode=<mode>`: Classifier execution and triage mode:
-  - `java-triage-python` (*default*): Uses Java virtual threads for sub-millisecond EXIF/header inspection to certify obvious camera photos into `~/memories/{YYYY}/photos/` (bypassing Python), while safely staging candidate images for deep Python CLIP/OCR/Gemini classification.
+  - `java-triage-python` (*default*): Uses Java virtual threads for sub-millisecond EXIF/header inspection to certify obvious camera photos into `~/archive/memories/{YYYY}/photos/` (bypassing Python), while safely staging candidate images for deep Python CLIP/OCR/Gemini classification.
   - `python`: Bypasses Java triage and evaluates all extracted images directly in Python.
   - `java-only`: Runs only fast Java-level camera triage without launching the Python process.
   - `disabled`: Skips classification entirely (equivalent to `--no-classify`).
 - `--dry-run`: Runs classifier in audit mode without moving or altering any files (logs decisions to CSV and console).
 - `--move` (*default*): Moves classified memes and greetings into target directories.
 - `--copy`: Copies memes and greetings to target directories instead of moving them.
-- `--quarantine` (*default*): Routes memes and greetings into `~/memories/quarantine/{YYYY}/`.
-- `--classify` (or `--classify-only`): Runs in classify-only mode to evaluate and organize extracted media already in the output directory (`~/memories/{YYYY}/photos/` by default or specified via `--output` / positional directory) without performing a new source extraction.
+- `--quarantine` (*default*): Routes memes and greetings into `~/archive/memories/quarantine/{YYYY}/`.
+- `--classify` (or `--classify-only`): Runs in classify-only mode to evaluate and organize extracted media already in the output directory (`~/archive/memories/{YYYY}/photos/` by default or specified via `--output` / positional directory) without performing a new source extraction.
 - `--resume`: Resumes classification on existing memories directory (equivalent to `--classify`).
 - `--no-classify`: Skips the classification stage entirely (performs pure media extraction and deduplication).
 - `--no-resume`: Disables progress-state resume and forces re-evaluation of all candidate images.
-- `--state-db=<path>`: Specifies custom path for the SQLite progress-state database (default: `~/memories/.classifier-state/classification.sqlite3`).
-- `--sanitize` or `--clean`: Runs in sanitization mode to audit existing files in `~/memories/`, quarantines corrupted files, removes duplicates, and prunes empty directories without performing a new source extraction.
+- `--state-db=<path>`: Specifies custom path for the SQLite progress-state database (default: `~/archive/memories/.classifier-state/classification.sqlite3`).
+- `--incremental`: Runs incremental extraction and packages newly added files from this run into split 7-Zip backup archives (`.7z.001`, `.7z.002`, etc.) in `<output>/backups`.
+- `--backup-dir=<dir>` / `-b <dir>`: Sets destination directory for 7-Zip backup parts (default: `<output>/backups`).
+- `--backup-part-size=<size>`: Sets volume split size, e.g. `4g`, `2g`, `1000m` (default: `4g`).
+- `--backup-compression=<level>`: Sets 7-Zip compression level: `0` (store), `1` (fast, default), `5` (normal), `9` (ultra).
+- `--backup-7z-binary=<path>`: Custom path to 7-Zip executable (default: `/usr/bin/7z`).
+- `--sanitize` or `--clean`: Runs in sanitization mode to audit existing files in `~/archive/memories/`, quarantines corrupted files, removes duplicates, and prunes empty directories without performing a new source extraction.
 
 **Output Directory Structure:**
 
 Media files are extracted and organized by year in the user's home directory:
 ```
-~/memories/
+~/archive/memories/
   ├── 2023/
   │   ├── photos/
   │   │   ├── photo1.jpg
@@ -81,9 +86,9 @@ Media files are extracted and organized by year in the user's home directory:
 ```
 
 **Key Features:**
-- Photos extracted to: `~/memories/{YYYY}/photos/`
-- Videos extracted to: `~/memories/{YYYY}/videos/`
-- Corrupted media quarantined to: `~/memories/quarantine/{YYYY}/`
+- Photos extracted to: `~/archive/memories/{YYYY}/photos/`
+- Videos extracted to: `~/archive/memories/{YYYY}/videos/`
+- Corrupted media quarantined to: `~/archive/memories/quarantine/{YYYY}/`
 - Year ({YYYY}) is determined by intelligent multi-source hierarchy:
   1. Photo EXIF metadata (`DateTimeOriginal` from header buffer)
   2. Video container metadata (MP4/QuickTime `mvhd` creation timestamp)
@@ -276,4 +281,41 @@ Classification progress is authoritatively managed in a durable SQLite database 
 - **Orphan Staging Recovery**: Java triage scans for abandoned `.staging-*` directories on startup, reconciling staged files with manifests and safely restoring them without overwriting user data.
 - **Graceful Cancellation**: Handles `SIGINT` (Ctrl+C) and `SIGTERM`, stopping cleanly after the active batch, checkpointing progress, and flushing metadata.
 - **Report Consistency**: `classification_results.csv` and `review_queue.csv` are synced and fsynced atomically with no duplicate rows during resumes.
+
+### Incremental Extraction & 7-Zip Backup Mode
+
+When you have a baseline backup of `~/archive/memories` stored on an external drive, re-compressing hundreds of gigabytes for every new SD card ingestion is slow and causes excessive drive wear.
+
+The `--incremental` flag enables **incremental extraction and packaging**:
+1. **Deduplication**: Scans incoming source directories and copies only brand new photos and videos into `~/archive/memories/{YYYY}/`.
+2. **Classification**: New photos undergo camera triage and AI classification; memes and greetings are relocated to `~/archive/memories/quarantine/{YYYY}/`.
+3. **Packaging**: Collects only the newly extracted media files, quarantined items, run extraction reports (`media-extraction-report-*.json/html`), and updated classification CSVs.
+4. **Split 7-Zip Archive**: Invokes native `/usr/bin/7z` with multithreading (`-mmt=on`), fast compression (`-mx=1`), and volume splitting (default: `-v4g`, compatible with FAT32/exFAT drives).
+5. **Integrity Test**: Automatically runs `7z t` to verify archive integrity before finishing.
+6. **Local Staging**: Part files (`.7z.001`, `.7z.002`, etc.) and a JSON receipt are generated locally in `<output>/backups` (default: `~/archive/memories/backups`) ready for manual transfer to your external drive.
+
+**Usage Examples:**
+
+```bash
+# Ingest new camera SD card with incremental 4GB split backup
+./scripts/run_pipeline.sh /media/sdcard/DCIM --incremental
+
+# Specify custom backup folder (e.g. directly on a mounted external drive)
+./scripts/run_pipeline.sh /media/sdcard/DCIM --incremental --backup-dir=/mnt/external_backup/incremental
+
+# Custom part size and compression
+./scripts/run_pipeline.sh /media/sdcard/DCIM --incremental --backup-part-size=2g --backup-compression=fast
+```
+
+**Disaster Recovery Restoration:**
+
+To restore files onto a fresh system:
+```bash
+# 1. Restore the baseline backup
+7z x memories_base.7z.001 -o~/archive/memories/
+
+# 2. Overlay incremental backup updates in chronological order
+7z x memories_incremental_20260912_150328.7z.001 -aoa -o~/archive/memories/
+```
+The relative directory structure (`{YYYY}/photos/`, `{YYYY}/videos/`, `quarantine/`, `reports/`) matches seamlessly.
 
