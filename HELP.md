@@ -318,4 +318,3 @@ To restore files onto a fresh system:
 7z x memories_incremental_20260912_150328.7z.001 -aoa -o~/archive/memories/
 ```
 The relative directory structure (`{YYYY}/photos/`, `{YYYY}/videos/`, `quarantine/`, `reports/`) matches seamlessly.
-
